@@ -1,0 +1,27 @@
+# VIDSUM-GNN Prototype Tasks
+
+- [x] Project Initialization & Configuration <!-- id: 0 -->
+    - [x] Create project directory structure <!-- id: 1 -->
+    - [x] Setup [pyproject.toml](file:///e:/5th%20SEM%20Data/AI253IA-Artificial%20Neural%20Networks%20and%20deep%20learning%28ANNDL%29/ANN_Project/pyproject.toml) and dependencies <!-- id: 2 -->
+    - [x] Create [Dockerfile](file:///e:/5th%20SEM%20Data/AI253IA-Artificial%20Neural%20Networks%20and%20deep%20learning%28ANNDL%29/ANN_Project/Dockerfile) and [docker-compose.yml](file:///e:/5th%20SEM%20Data/AI253IA-Artificial%20Neural%20Networks%20and%20deep%20learning%28ANNDL%29/ANN_Project/docker-compose.yml) <!-- id: 3 -->
+- [x] Database Schema & Setup <!-- id: 4 -->
+    - [x] Define TimescaleDB schema (SQL/Python models) <!-- id: 5 -->
+    - [x] Implement DB client and CRUD operations <!-- id: 6 -->
+- [x] Video Processing & Shot Detection <!-- id: 7 -->
+    - [x] Implement `video_preprocessor` (FFmpeg probe, transcode, chunk) <!-- id: 8 -->
+    - [x] Implement `shot_detector` (histogram/PySceneDetect placeholder) <!-- id: 9 -->
+    - [x] Implement `frame_sampler` <!-- id: 10 -->
+- [x] Feature Extraction <!-- id: 11 -->
+    - [x] Implement `feature_encoders` (ViT, Wav2Vec2 wrappers) <!-- id: 12 -->
+    - [x] Implement `audio_extractor` <!-- id: 13 -->
+- [x] Graph Construction & GNN Model <!-- id: 14 -->
+    - [x] Implement `graph_builder` (nodes, edges, sparsification) <!-- id: 15 -->
+    - [x] Implement `gnn_model` (GATv2 architecture) <!-- id: 16 -->
+- [x] Summary Generation <!-- id: 17 -->
+    - [x] Implement `selector` (Greedy/Knapsack strategies) <!-- id: 18 -->
+    - [x] Implement `assembler` (FFmpeg concatenation) <!-- id: 19 -->
+- [x] API Development <!-- id: 20 -->
+    - [x] Implement FastAPI endpoints (upload, process, status, results) <!-- id: 21 -->
+    - [x] Implement background task orchestration <!-- id: 22 -->
+- [x] Verification & Documentation <!-- id: 23 -->
+    - [x] Create [walkthrough.md](file:///C:/Users/Home/.gemini/antigravity/brain/ed3fc7ed-170c-4369-9a03-d89113dfb431/walkthrough.md) <!-- id: 24 -->

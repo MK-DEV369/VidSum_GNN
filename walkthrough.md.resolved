@@ -1,0 +1,89 @@
+# VIDSUM-GNN Walkthrough
+
+This document guides you through setting up and running the VIDSUM-GNN backend prototype.
+
+## Prerequisites
+
+- **Docker** and **Docker Compose** installed.
+- **NVIDIA Drivers** and **NVIDIA Container Toolkit** (for GPU support).
+- **Python 3.10+** (if running locally without Docker).
+
+## Setup & Installation
+
+1.  **Build and Start Services**
+    ```bash
+    docker-compose up --build
+    ```
+    This command will:
+    - Build the FastAPI application image.
+    - Pull the TimescaleDB image.
+    - Start both services.
+    - The API will be available at `http://localhost:8000`.
+
+2.  **Verify Database**
+    The application automatically initializes the database schema on startup. You can check the logs to confirm:
+    ```bash
+    docker-compose logs -f app
+    ```
+
+## Usage Guide
+
+### 1. Upload a Video
+Upload a video file to the system.
+```bash
+curl -X POST "http://localhost:8000/api/upload" \
+  -H "accept: application/json" \
+  -H "Content-Type: multipart/form-data" \
+  -F "file=@/path/to/your/video.mp4"
+```
+**Response:**
+```json
+{
+  "video_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "queued"
+}
+```
+
+### 2. Start Processing
+Trigger the summarization pipeline for the uploaded video.
+```bash
+curl -X POST "http://localhost:8000/api/process/550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target_duration": 60,
+    "strategy": "greedy",
+    "style": "balanced"
+  }'
+```
+
+### 3. Check Status
+Poll the status of the processing task.
+```bash
+curl -X GET "http://localhost:8000/api/status/550e8400-e29b-41d4-a716-446655440000"
+```
+**Response:**
+```json
+{
+  "status": "gnn_inference" 
+}
+```
+(Statuses: `queued`, `preprocessing`, `shot_detection`, `feature_extraction`, `gnn_inference`, `assembling`, `completed`)
+
+### 4. Get Results
+Once completed, retrieve the summary details.
+```bash
+curl -X GET "http://localhost:8000/api/results/550e8400-e29b-41d4-a716-446655440000"
+```
+
+## System Architecture
+
+- **FastAPI**: Handles API requests and background task orchestration.
+- **TimescaleDB**: Stores video metadata, shots, and embeddings.
+- **FFmpeg**: Performs video transcoding, shot detection, and summary assembly.
+- **PyTorch / PyG**: Runs the GATv2 Graph Neural Network for shot scoring.
+- **Transformers**: Extracts visual (ViT) and audio (Wav2Vec2) features.
+
+## Notes
+
+- **GPU Usage**: The [docker-compose.yml](file:///e:/5th%20SEM%20Data/AI253IA-Artificial%20Neural%20Networks%20and%20deep%20learning%28ANNDL%29/ANN_Project/docker-compose.yml) is configured to use NVIDIA GPUs. If you don't have a GPU, remove the `deploy` section in [docker-compose.yml](file:///e:/5th%20SEM%20Data/AI253IA-Artificial%20Neural%20Networks%20and%20deep%20learning%28ANNDL%29/ANN_Project/docker-compose.yml) and ensure PyTorch is installed with CPU support (the Dockerfile uses a CUDA base image, which works on CPU but is large).
+- **Mocking**: For this prototype, some heavy operations (like full audio extraction for long videos) might be simplified or mocked in [tasks.py](file:///e:/5th%20SEM%20Data/AI253IA-Artificial%20Neural%20Networks%20and%20deep%20learning%28ANNDL%29/ANN_Project/vidsum_gnn/api/tasks.py) to ensure quick testing. Uncomment the actual logic for production use.

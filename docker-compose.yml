@@ -1,0 +1,125 @@
+version: '3.8'
+
+services:
+  # FastAPI ML Processing Service
+  ml_api:
+    build: .
+    container_name: vidsum_gnn_ml_api
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/vidsum
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=vidsum
+      - LOG_LEVEL=INFO
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+    command: uvicorn vidsum_gnn.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # React TypeScript Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vidsum_gnn_frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - ml_api
+    command: npm run dev
+
+  # TimescaleDB (PostgreSQL with time-series extension)
+  db:
+    image: timescale/timescaledb:latest-pg15
+    container_name: vidsum_gnn_db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=vidsum
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: postgres -c shared_preload_libraries=timescaledb
+
+  # Redis for caching and async tasks
+  redis:
+    image: redis:7-alpine
+    container_name: vidsum_gnn_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+volumes:
+  postgres_data:
+  redis_data:
+
+    # version: "3.8"
+
+    # services:
+    #   app:
+    #     build: .
+    #     container_name: vidsum_gnn_app
+    #     ports:
+    #       - "8000:8000"
+    #     volumes:
+    #       - .:/app
+    #       - ./data:/app/data
+    #     environment:
+    #       - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/vidsum
+    #       - POSTGRES_USER=postgres
+    #       - POSTGRES_PASSWORD=password
+    #       - POSTGRES_DB=vidsum
+    #       - NVIDIA_VISIBLE_DEVICES=all
+    #       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    #     depends_on:
+    #       - db
+    #     # GPU Support
+    #     deploy:
+    #       resources:
+    #         reservations:
+    #           devices:
+    #             - driver: nvidia
+    #               count: 1
+    #               capabilities: [gpu]
+    #     # For local docker-compose (Compose v2 GPU support)
+    #     gpus: all
+    #     restart: unless-stopped
+    #     runtime: nvidia
+
+    #   db:
+    #     image: timescale/timescaledb:latest-pg15
+    #     container_name: vidsum_gnn_db
+    #     ports:
+    #       - "5432:5432"
+    #     environment:
+    #       - POSTGRES_USER=postgres
+    #       - POSTGRES_PASSWORD=password
+    #       - POSTGRES_DB=vidsum
+    #     volumes:
+    #       - postgres_data:/var/lib/postgresql/data
+    #     restart: unless-stopped
+
+    # volumes:
+    #   postgres_data:
