@@ -167,7 +167,7 @@ Output Video + Metadata
 | Technology | Purpose |
 |-----------|---------|
 | **FastAPI** | Async web framework |
-| **PyTorch 2.1** | Deep learning framework |
+| **PyTorch 2.5.1 (CUDA 12.1)** | Deep learning framework |
 | **PyTorch Geometric** | Graph neural networks |
 | **Transformers** | Pretrained models (ViT, Wav2Vec2) |
 | **FFmpeg** | Video/audio processing |
@@ -188,10 +188,57 @@ VidSumGNN (GAT-based)
 ### Infrastructure
 | Component | Technology |
 |-----------|-----------|
-| **Database** | PostgreSQL 15 + TimescaleDB |
+| **Database** | PostgreSQL 18 + TimescaleDB |
 | **Caching** | Redis 7 |
 | **Containers** | Docker + Docker Compose |
 | **GPU Support** | NVIDIA CUDA 12.1 |
+
+---
+
+## 🧩 Environment & Upgrade (PyTorch/CUDA)
+
+### Current Versions
+- Torch: 2.5.1+cu121
+- TorchVision: 0.20.1+cu121
+- TorchAudio: 2.5.1+cu121
+- PyTorch Geometric: 2.7.0
+- CUDA Toolkit: 12.1 (runtime via PyTorch wheels)
+- NVIDIA Driver: recommended \u2265 530.30.02 for cu121
+
+### Use Project venv
+```powershell
+venv/Scripts/activate
+```
+
+### Backup and Upgrade
+```powershell
+# Backup current environment
+pip freeze > requirements_backup.txt
+
+# Stable upgrade within CUDA 12.1
+pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Reinstall PyG extensions to match Torch ABI
+pip install --upgrade torch-geometric torch-scatter torch-sparse --no-cache-dir
+```
+
+### Nightly (Pre-release) Torch 2.6+
+If 2.6.x stable isn\'t available yet, use nightly:
+```powershell
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
+pip install --force-reinstall --no-cache-dir torch-geometric torch-scatter torch-sparse
+```
+
+### Verify
+```powershell
+python -c "import torch; print('Torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'Avail:', torch.cuda.is_available())"
+python -c "import torch_scatter, torch_sparse; print('torch_scatter OK'); print('torch_sparse OK')"
+```
+
+### Rollback
+```powershell
+pip install -r requirements_backup.txt --force-reinstall
+```
 
 ---
 
@@ -1410,4 +1457,4 @@ If you use this project in your research, please cite:
 
 **Built with ❤️ using Graph Neural Networks**
 
-*Last Updated: December 25, 2025*
+*Last Updated: December 26, 2025*
