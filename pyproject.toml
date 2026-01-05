@@ -22,7 +22,7 @@ dependencies = [
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.23.0",
 
-    # Match the PyTorch wheels provided by base image
+    # Match the PyTorch wheels provided by base image - DO NOT UPGRADE
     "torch==2.1.0",
     "torchvision==0.16.0",
     "torchaudio==2.1.0",
@@ -33,8 +33,10 @@ dependencies = [
     # Media / Audio processing
     "librosa>=0.10.0",
 
-    # Transformers & NLP
-    "transformers==4.37.0",
+    # Transformers & NLP - PINNED for PyTorch 2.1.0 compatibility
+    "transformers==4.35.2",  # Last version fully compatible with torch 2.1.0
+    "sentence-transformers==2.2.2",  # Pinned to avoid pulling newer torch
+    "tokenizers<0.15.0",  # Compatible with transformers 4.35.2
 
     # Database + Async
     "sqlalchemy>=2.0.0",
@@ -47,9 +49,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "httpx>=0.24.0",
 
-    # ML Essentials
-    "numpy>=1.26.0",
+    # ML Essentials - compatible with pandas and torch 2.1.0
+    "numpy>=1.23.0,<2.0.0",
     "pandas==2.1.2",  # pin to a stable 2.x wheel available for Python 3.10
+    "scikit-learn>=1.3.0,<1.4.0",  # Compatible with numpy < 2.0
 
     # Video decoding (GPU/CPU hybrid)
     "decord>=0.6.0",

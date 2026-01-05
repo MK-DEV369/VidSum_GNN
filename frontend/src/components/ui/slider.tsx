@@ -1,23 +1,16 @@
 import * as React from "react"
-import { cn } from "@/lib/utils"
+import { cn } from "../../lib/utils"
 
 // Lightweight slider without Radix to avoid hook conflicts
-type SliderProps = React.InputHTMLAttributes<HTMLInputElement> & {
+type SliderProps = Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange'> & {
   value?: number[]
   onValueChange?: (value: number[]) => void
 }
 
 const Slider = React.forwardRef<HTMLInputElement, SliderProps>(
-  ({ className, value = [0], min = 0, max = 100, step = 1, onChange, onValueChange, disabled, ...props }, ref) => {
+  ({ className, value = [0], min = 0, max = 100, step = 1, onValueChange, disabled, ...props }, ref) => {
     const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
       const v = Number(e.target.value)
-      onChange?.({
-        ...e,
-        target: {
-          ...e.target,
-          value: v,
-        },
-      } as unknown as React.ChangeEvent<HTMLInputElement>)
       onValueChange?.([v])
     }
 

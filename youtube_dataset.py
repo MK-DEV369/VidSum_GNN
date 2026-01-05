@@ -22,8 +22,10 @@ from scipy.ndimage import gaussian_filter1d
 # ============================================================================
 
 RAW_YOUTUBE_DIR = Path("model/data/raw/youtube")
-RAW_UGC_DIR = Path("model/data/raw/ugc")
-PROCESSED_OUTPUT_DIR = Path("model/data/processed/features")
+RAW_TVSUMME_DIR = Path("model/data/raw/tvsum")
+RAW_SUMME_DIR = Path("model/data/raw/summe")
+
+UNIFIED_OUTPUT_DIR = Path("model/data/processed/unified_dataset")
 
 
 # ============================================================================
@@ -33,11 +35,26 @@ PROCESSED_OUTPUT_DIR = Path("model/data/processed/features")
 
 @dataclass
 class ShotFeatures:
-    motion: float
-    speech: float
-    scene_change: float
-    audio_energy: float
-    object_count: float
+    # Temporal
+    duration: float
+    relative_position: float  # shot_index / total_shots
+    
+    # Motion (descriptive, not scored)
+    motion_mean: float
+    motion_std: float
+    motion_peak: float
+    
+    # Audio (rich descriptors)
+    rms_energy: float
+    rms_delta: float
+    spectral_flux: float
+    pitch_mean: float
+    pitch_std: float
+    silence_ratio: float
+    
+    # Visual change
+    scene_cut_strength: float
+    color_hist_delta: float
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -48,15 +65,15 @@ class Shot:
     start: float
     end: float
     features: ShotFeatures
-    importance: float
-    rank: Optional[int] = None
+    label: Optional[float] = None  # For supervised learning (0/1 or score)
+    rank: Optional[int] = None     # For reference only
 
     def to_dict(self) -> Dict[str, object]:
         return {
             "start": self.start,
             "end": self.end,
             "features": self.features.to_dict(),
-            "importance": self.importance,
+            "label": self.label,
             "rank": self.rank,
         }
 
@@ -87,11 +104,15 @@ DOMAIN_WEIGHTS: Dict[str, Dict[str, float]] = {
     "sports": {"motion": 0.5, "speech": 0.1, "scene_change": 0.2, "audio_energy": 0.1, "object_count": 0.1},
     "documentary": {"motion": 0.25, "speech": 0.25, "scene_change": 0.2, "audio_energy": 0.2, "object_count": 0.1},
     "gaming": {"motion": 0.6, "speech": 0.15, "scene_change": 0.15, "audio_energy": 0.05, "object_count": 0.05},
+    "music": {"motion": 0.4, "speech": 0.3, "scene_change": 0.15, "audio_energy": 0.1, "object_count": 0.05},
+    "movie_trailer": {"motion": 0.45, "speech": 0.2, "scene_change": 0.2, "audio_energy": 0.1, "object_count": 0.05},
+    "movie_clip": {"motion": 0.5, "speech": 0.25, "scene_change": 0.15, "audio_energy": 0.05, "object_count": 0.05},
     "vlog": {"motion": 0.2, "speech": 0.5, "scene_change": 0.1, "audio_energy": 0.15, "object_count": 0.05},
     "default": {"motion": 0.35, "speech": 0.25, "scene_change": 0.2, "audio_energy": 0.1, "object_count": 0.1},
 }
 
 MOTION_DOWNSCALE_WIDTH = 640  # None to disable
+MOTION_FRAME_SKIP = 1         # Process every Nth frame for motion to save RAM
 MOTION_DISABLED_DOMAINS = {"lecture", "interview"}
 SHOT_GC_INTERVAL = 10
 
@@ -141,13 +162,50 @@ def download_playlist(playlist_url: str, playlist_name: str, output_base: Path =
     return list(output_dir.glob("*.mp4"))
 
 
+def download_individual_video(video_url: str, video_id: str, output_base: Path = RAW_YOUTUBE_DIR) -> Optional[Path]:
+    """Download a single video by URL. Returns path to video or None if failed."""
+    output_dir = output_base / "high_importance"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "yt-dlp",
+        "--extractor-args", "youtube:player-client=android",
+        "--remote-components", "ejs:github",
+        "-f", "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+        "-o", f"{output_dir}/{video_id}.%(ext)s",
+        "--write-info-json",
+        video_url,
+    ]
+
+    try:
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            video_files = list(output_dir.glob(f"{video_id}.mp4"))
+            return video_files[0] if video_files else None
+        else:
+            print(f"Warning: Failed to download {video_id}: {result.stderr}")
+            return None
+    except Exception as exc:
+        print(f"Error downloading {video_id}: {exc}")
+        return None
+
+
 # ============================================================================
 # Step 1: Audio Extraction
 # ============================================================================
 
 
 def extract_audio(video_path: Path, output_dir: str = "model/data/raw/youtube/audio") -> Path:
-    """Extract mono 16k WAV from video."""
+    """Extract mono 16k WAV from video. Returns None if no audio stream exists."""
+    import shutil
+
+    # Check if FFmpeg is installed
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "FFmpeg not found. Please install FFmpeg:\n"
+            "  Windows: https://ffmpeg.org/download.html or 'choco install ffmpeg'\n"
+            "  Add FFmpeg to your system PATH"
+        )
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     audio_path = Path(output_dir) / f"{video_path.stem}.wav"
@@ -167,8 +225,19 @@ def extract_audio(video_path: Path, output_dir: str = "model/data/raw/youtube/au
         "-y",
     ]
 
-    subprocess.run(cmd, check=True, capture_output=True)
-    return audio_path
+    try:
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            return audio_path
+        
+        # Check if no audio stream found
+        if "Output file does not contain any stream" in result.stderr or "no audio streams" in result.stderr.lower():
+            return None  # Signal that this video has no audio
+        else:
+            error_msg = result.stderr or f"FFmpeg failed with code {result.returncode}"
+            raise RuntimeError(f"Audio extraction failed: {error_msg}")
+    except FileNotFoundError:
+        raise RuntimeError("FFmpeg not found. Please install FFmpeg and add it to PATH.")
 
 
 # ============================================================================
@@ -218,35 +287,189 @@ def compute_motion_score(video_path: Path, start: float, end: float) -> float:
     max_frames = int((end - start) * fps) if fps > 0 else 0
 
     while frame_count < max_frames:
+        try:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Skip frames to save memory and time
+            if frame_count % MOTION_FRAME_SKIP != 0:
+                frame_count += 1
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if MOTION_DOWNSCALE_WIDTH and gray.shape[1] > MOTION_DOWNSCALE_WIDTH:
+                new_h = int(gray.shape[0] * (MOTION_DOWNSCALE_WIDTH / gray.shape[1]))
+                gray = cv2.resize(gray, (MOTION_DOWNSCALE_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+
+            flow = cv2.calcOpticalFlowFarneback(
+                prev_gray,
+                gray,
+                None,
+                pyr_scale=0.5,
+                levels=3,
+                winsize=15,
+                iterations=3,
+                poly_n=5,
+                poly_sigma=1.2,
+                flags=0,
+            )
+
+            mag = float(np.mean(np.linalg.norm(flow, axis=2)))
+            scores.append(mag)
+            prev_gray = gray
+            frame_count += 1
+            
+            # Explicitly clear flow to help GC
+            del flow
+            
+        except cv2.error as e:
+            print(f"      Warning: OpenCV error during motion extraction at frame {frame_count}: {e}")
+            frame_count += 1
+            continue
+        except Exception as e:
+            print(f"      Warning: Unexpected error during motion extraction: {e}")
+            break
+
+    cap.release()
+    return float(np.mean(scores)) if len(scores) > 0 else 0.0
+
+
+def compute_motion_scores_array(video_path: Path, start: float, end: float, domain: str) -> np.ndarray:
+    """Compute optical flow magnitudes across frames. Returns array for stats (mean, std, peak)."""
+    
+    if domain in MOTION_DISABLED_DOMAINS:
+        return np.array([0.0])
+
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+    ret, prev = cap.read()
+    if not ret:
+        cap.release()
+        return np.array([0.0])
+
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+    if MOTION_DOWNSCALE_WIDTH and prev_gray.shape[1] > MOTION_DOWNSCALE_WIDTH:
+        new_h = int(prev_gray.shape[0] * (MOTION_DOWNSCALE_WIDTH / prev_gray.shape[1]))
+        prev_gray = cv2.resize(prev_gray, (MOTION_DOWNSCALE_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+
+    scores: List[float] = []
+    frame_count = 0
+    max_frames = int((end - start) * fps) if fps > 0 else 0
+
+    while frame_count < max_frames:
+        try:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_count % MOTION_FRAME_SKIP != 0:
+                frame_count += 1
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if MOTION_DOWNSCALE_WIDTH and gray.shape[1] > MOTION_DOWNSCALE_WIDTH:
+                new_h = int(gray.shape[0] * (MOTION_DOWNSCALE_WIDTH / gray.shape[1]))
+                gray = cv2.resize(gray, (MOTION_DOWNSCALE_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+
+            flow = cv2.calcOpticalFlowFarneback(
+                prev_gray, gray, None, pyr_scale=0.5, levels=3, winsize=15,
+                iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
+            )
+
+            mag = float(np.mean(np.linalg.norm(flow, axis=2)))
+            scores.append(mag)
+            prev_gray = gray
+            frame_count += 1
+            del flow
+            
+        except (cv2.error, Exception) as e:
+            frame_count += 1
+            continue
+
+    cap.release()
+    return np.array(scores) if scores else np.array([0.0])
+
+
+def compute_audio_descriptors(audio_path: Path, start: float, end: float) -> Tuple[float, float, float, float, float, float]:
+    """Extract rich audio descriptors: RMS energy, delta, spectral flux, pitch mean/std, silence ratio."""
+    
+    duration = end - start
+    if duration <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    try:
+        y, sr = librosa.load(str(audio_path), sr=16000, offset=start, duration=duration)
+        
+        # RMS energy
+        rms = librosa.feature.rms(y=y)[0]
+        rms_energy = float(np.mean(rms))
+        rms_delta = float(np.std(rms)) if len(rms) > 1 else 0.0
+        
+        # Spectral flux (change in spectrum)
+        S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+        spec_flux = np.sqrt(np.sum(np.diff(S, axis=1) ** 2, axis=0))
+        spectral_flux = float(np.mean(spec_flux)) if len(spec_flux) > 0 else 0.0
+        
+        # Pitch estimation via fundamental frequency
+        f0 = librosa.yin(y, fmin=50, fmax=400)
+        pitch_mean = float(np.nanmean(f0)) if not np.all(np.isnan(f0)) else 0.0
+        pitch_std = float(np.nanstd(f0)) if not np.all(np.isnan(f0)) else 0.0
+        
+        # Silence ratio
+        silence_threshold = 0.02
+        silent_frames = np.sum(rms < silence_threshold)
+        silence_ratio = float(silent_frames / len(rms)) if len(rms) > 0 else 0.0
+        
+        return rms_energy, rms_delta, spectral_flux, pitch_mean, pitch_std, silence_ratio
+        
+    except Exception as e:
+        print(f"      Warning: Audio descriptor extraction failed - {e}")
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+
+def compute_visual_change_features(video_path: Path, start: float, end: float) -> Tuple[float, float]:
+    """Extract visual change features: scene cut strength and color histogram delta."""
+    
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+    
+    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
+    ret, first_frame = cap.read()
+    if not ret:
+        cap.release()
+        return 0.0, 0.0
+
+    # Get last frame
+    max_frames = int((end - start) * fps)
+    frame_count = 0
+    last_frame = first_frame
+    
+    while frame_count < max_frames:
         ret, frame = cap.read()
         if not ret:
             break
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if MOTION_DOWNSCALE_WIDTH and gray.shape[1] > MOTION_DOWNSCALE_WIDTH:
-            new_h = int(gray.shape[0] * (MOTION_DOWNSCALE_WIDTH / gray.shape[1]))
-            gray = cv2.resize(gray, (MOTION_DOWNSCALE_WIDTH, new_h), interpolation=cv2.INTER_AREA)
-
-        flow = cv2.calcOpticalFlowFarneback(
-            prev_gray,
-            gray,
-            None,
-            pyr_scale=0.5,
-            levels=3,
-            winsize=15,
-            iterations=3,
-            poly_n=5,
-            poly_sigma=1.2,
-            flags=0,
-        )
-
-        mag = float(np.mean(np.linalg.norm(flow, axis=2)))
-        scores.append(mag)
-        prev_gray = gray
+        last_frame = frame
         frame_count += 1
 
     cap.release()
-    return float(np.mean(scores)) if scores else 0.0
+
+    # Scene cut strength: compare first and last frame
+    diff = cv2.absdiff(first_frame, last_frame)
+    scene_cut_strength = float(np.mean(diff) / 255.0)
+
+    # Color histogram delta
+    hist_first = cv2.calcHist([first_frame], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    hist_last = cv2.calcHist([last_frame], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    
+    hist_first = cv2.normalize(hist_first, hist_first).flatten()
+    hist_last = cv2.normalize(hist_last, hist_last).flatten()
+    
+    color_hist_delta = float(cv2.compareHist(hist_first, hist_last, cv2.HISTCMP_BHATTACHARYYA))
+
+    return scene_cut_strength, color_hist_delta
 
 
 def compute_speech_activity(audio_path: Path, start: float, end: float) -> float:
@@ -272,16 +495,59 @@ def compute_audio_energy(audio_path: Path, start: float, end: float) -> float:
     return float(np.mean(np.abs(y)))
 
 
-def extract_shot_features(video_path: Path, audio_path: Path, start: float, end: float, domain: str) -> ShotFeatures:
-    """Extract shot-level features; skip motion for configured domains."""
+def compute_audio_peakiness(audio_path: Path, start: float, end: float, window: float = 5.0) -> float:
+    """
+    Measures how much louder this shot is compared to its local neighborhood.
+    """
+    y, sr = librosa.load(str(audio_path), sr=16000)
+    t_start = int(start * sr)
+    t_end = int(end * sr)
 
-    motion_val = 0.0 if domain in MOTION_DISABLED_DOMAINS else compute_motion_score(video_path, start, end)
+    if t_end <= t_start:
+        return 0.0
+
+    shot_energy = np.mean(np.abs(y[t_start:t_end]))
+
+    w = int(window * sr)
+    local_start = max(0, t_start - w)
+    local_end = min(len(y), t_end + w)
+
+    local_energy = np.mean(np.abs(y[local_start:local_end])) + 1e-6
+    return float(shot_energy / local_energy)
+
+
+def extract_shot_features(video_path: Path, audio_path: Path, start: float, end: float, domain: str, shot_index: int = 0, total_shots: int = 1) -> ShotFeatures:
+    """Extract rich shot-level descriptors. No importance scoring — let GNN learn."""
+    
+    duration = end - start
+    relative_position = shot_index / max(total_shots, 1)
+    
+    # Motion features (mean, std, peak)
+    motion_scores = compute_motion_scores_array(video_path, start, end, domain)
+    motion_mean = float(np.mean(motion_scores)) if len(motion_scores) > 0 else 0.0
+    motion_std = float(np.std(motion_scores)) if len(motion_scores) > 0 else 0.0
+    motion_peak = float(np.max(motion_scores)) if len(motion_scores) > 0 else 0.0
+    
+    # Audio features (rich descriptors)
+    rms_energy, rms_delta, spectral_flux, pitch_mean, pitch_std, silence_ratio = compute_audio_descriptors(audio_path, start, end)
+    
+    # Visual change features
+    scene_cut_strength, color_hist_delta = compute_visual_change_features(video_path, start, end)
+    
     return ShotFeatures(
-        motion=motion_val,
-        speech=compute_speech_activity(audio_path, start, end),
-        scene_change=1.0,
-        audio_energy=compute_audio_energy(audio_path, start, end),
-        object_count=1.0,
+        duration=duration,
+        relative_position=relative_position,
+        motion_mean=motion_mean,
+        motion_std=motion_std,
+        motion_peak=motion_peak,
+        rms_energy=rms_energy,
+        rms_delta=rms_delta,
+        spectral_flux=spectral_flux,
+        pitch_mean=pitch_mean,
+        pitch_std=pitch_std,
+        silence_ratio=silence_ratio,
+        scene_cut_strength=scene_cut_strength,
+        color_hist_delta=color_hist_delta,
     )
 
 
@@ -291,30 +557,21 @@ def extract_shot_features(video_path: Path, audio_path: Path, start: float, end:
 
 
 def normalize_features(shots_features: List) -> List[Dict[str, float]]:
+    """Normalize feature values to [0, 1] range per dimension."""
     if not shots_features:
         return []
 
     if isinstance(shots_features[0], ShotFeatures):
-        features_list = [
-            {
-                "motion": s.motion,
-                "speech": s.speech,
-                "scene_change": s.scene_change,
-                "audio_energy": s.audio_energy,
-                "object_count": s.object_count,
-            }
-            for s in shots_features
-        ]
+        features_list = [s.to_dict() for s in shots_features]
     else:
         features_list = shots_features
 
-    features_dict = {
-        "motion": [s["motion"] for s in features_list],
-        "speech": [s["speech"] for s in features_list],
-        "scene_change": [s["scene_change"] for s in features_list],
-        "audio_energy": [s["audio_energy"] for s in features_list],
-        "object_count": [s["object_count"] for s in features_list],
-    }
+    # Get all feature keys
+    if not features_list:
+        return []
+    
+    feature_keys = list(features_list[0].keys())
+    features_dict = {key: [s[key] for s in features_list] for key in feature_keys}
 
     normalized: Dict[str, np.ndarray] = {}
     for key, values in features_dict.items():
@@ -328,70 +585,29 @@ def normalize_features(shots_features: List) -> List[Dict[str, float]]:
     result: List[Dict[str, float]] = []
     for i in range(len(features_list)):
         result.append({
-            "motion": float(normalized["motion"][i]),
-            "speech": float(normalized["speech"][i]),
-            "scene_change": float(normalized["scene_change"][i]),
-            "audio_energy": float(normalized["audio_energy"][i]),
-            "object_count": float(normalized["object_count"][i]),
+            key: float(normalized[key][i]) for key in feature_keys
         })
 
     return result
 
 
-def compute_importance(features, weights: Optional[Dict[str, float]] = None, domain: Optional[str] = None) -> float:
-    if domain is not None:
-        weights = DOMAIN_WEIGHTS.get(domain, DOMAIN_WEIGHTS["default"])
-    elif weights is None:
-        weights = {"motion": 0.2, "speech": 0.2, "scene_change": 0.2, "audio_energy": 0.2, "object_count": 0.2}
-
-    if isinstance(features, dict):
-        motion = features["motion"]
-        speech = features["speech"]
-        scene_change = features["scene_change"]
-        audio_energy = features["audio_energy"]
-        object_count = features["object_count"]
-    else:
-        motion = features.motion
-        speech = features.speech
-        scene_change = features.scene_change
-        audio_energy = features.audio_energy
-        object_count = features.object_count
-
-    score = (
-        weights["motion"] * motion
-        + weights["speech"] * speech
-        + weights["scene_change"] * scene_change
-        + weights["audio_energy"] * audio_energy
-        + weights["object_count"] * object_count
+def compute_importance_DEPRECATED(features, weights: Optional[Dict[str, float]] = None, domain: Optional[str] = None) -> float:
+    """DEPRECATED: Do not use. Features are extracted; GNN learns importance."""
+    raise NotImplementedError(
+        "compute_importance has been removed. "
+        "Extract features and let the GNN learn importance from them. "
+        "Use pseudo-labels for YouTube data: Top-15% of shots by duration or other criteria."
     )
-    return float(score)
 
 
-def smooth_importance_scores(scores: List[float], sigma: float = 2.0) -> List[float]:
-    if len(scores) < 3:
-        return scores
-    smoothed = gaussian_filter1d(scores, sigma=sigma)
-    return smoothed.tolist()
+def emphasize_peaks_DEPRECATED(scores: List[float], gamma: float = 2.0) -> List[float]:
+    """DEPRECATED: Do not use. Let GNN learn what matters."""
+    raise NotImplementedError("emphasize_peaks_DEPRECATED: Let the GNN learn peak importance.")
 
 
-def assign_ranks(shots: List[Shot]) -> List[Shot]:
-    if not shots:
-        return []
-
-    ranked = [shot for shot in shots]
-    sorted_indices = sorted(range(len(ranked)), key=lambda i: ranked[i].importance, reverse=True)
-
-    for rank, idx in enumerate(sorted_indices, 1):
-        old_shot = ranked[idx]
-        ranked[idx] = Shot(
-            start=old_shot.start,
-            end=old_shot.end,
-            features=old_shot.features,
-            importance=old_shot.importance,
-            rank=rank,
-        )
-
-    return ranked
+def smooth_importance_scores_DEPRECATED(scores: List[float], sigma: float = 2.0) -> List[float]:
+    """DEPRECATED: Do not use. GNN can learn temporal patterns."""
+    raise NotImplementedError("smooth_importance_scores_DEPRECATED: Let the GNN learn temporal patterns.")
 
 
 # ============================================================================
@@ -400,30 +616,24 @@ def assign_ranks(shots: List[Shot]) -> List[Shot]:
 
 
 def process_video(video_path: Path, audio_path: Path, domain: str = "default", smooth_sigma: float = 2.0) -> VideoDataset:
-    weights = DOMAIN_WEIGHTS.get(domain, DOMAIN_WEIGHTS["default"])
+    """Process video: extract rich features. NO importance scoring. GNN learns from features."""
 
     shot_boundaries = detect_shots(video_path)
     print(f"Detected {len(shot_boundaries)} shots")
 
     shots_features: List[ShotFeatures] = []
     for i, (start, end) in enumerate(shot_boundaries):
-        print(f"Processing shot {i + 1}/{len(shot_boundaries)}..." + (" (skip motion)" if domain in MOTION_DISABLED_DOMAINS else ""))
-        features = extract_shot_features(video_path, audio_path, start, end, domain)
+        print(f"Processing shot {i + 1}/{len(shot_boundaries)}...")
+        features = extract_shot_features(video_path, audio_path, start, end, domain, shot_index=i, total_shots=len(shot_boundaries))
         shots_features.append(features)
         if (i + 1) % SHOT_GC_INTERVAL == 0:
             clear_memory()
 
-    shots_features = normalize_features(shots_features)
-
-    importance_scores = [compute_importance(f, weights) for f in shots_features]
-    importance_scores = smooth_importance_scores(importance_scores, sigma=smooth_sigma)
-
+    # Create shots WITHOUT importance scores
     shots = [
-        Shot(start=start, end=end, features=ShotFeatures(**feat), importance=imp)
-        for (start, end), feat, imp in zip(shot_boundaries, shots_features, importance_scores)
+        Shot(start=start, end=end, features=feat, label=None)
+        for (start, end), feat in zip(shot_boundaries, shots_features)
     ]
-
-    shots = assign_ranks(shots)
 
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
@@ -434,21 +644,51 @@ def process_video(video_path: Path, audio_path: Path, domain: str = "default", s
     return VideoDataset(video_id=video_path.stem, duration=duration, domain=domain, shots=shots)
 
 
+def apply_pseudo_labels_youtube(dataset: List[VideoDataset], top_k_ratio: float = 0.15) -> List[VideoDataset]:
+    """
+    Apply pseudo-labels to YouTube videos: Top-K shots per video → label 1, rest → label 0.
+    
+    Args:
+        dataset: List of VideoDataset objects
+        top_k_ratio: Fraction of shots to label as 1 (default 15%)
+    
+    Returns:
+        Updated dataset with labels assigned
+    """
+    for video in dataset:
+        num_shots = len(video.shots)
+        if num_shots == 0:
+            continue
+        
+        # Calculate top-K count
+        top_k = max(1, int(np.ceil(num_shots * top_k_ratio)))
+        
+        # Score shots by duration as a simple heuristic for pseudo-labels
+        # (GNN will learn better patterns, but duration is a reasonable proxy)
+        durations = [s.end - s.start for s in video.shots]
+        top_k_indices = np.argsort(durations)[-top_k:].tolist()
+        
+        # Assign labels
+        for i, shot in enumerate(video.shots):
+            shot.label = 1.0 if i in top_k_indices else 0.0
+    
+    return dataset
+
+
 def build_dataset(
     video_dir: Path = RAW_YOUTUBE_DIR,
     output_path: Optional[Path] = None,
     max_per_playlist: Optional[int] = 10,
     batch_size: int = 3,
     domain_map: Optional[Dict[str, Dict[str, str]]] = None,
-    playlist_filter: Optional[str] = None,
+    playlist_filter: Optional[List[str]] = None,
     save_frequency: str = "playlist",
-    include_ugc: bool = False,
 ) -> List[VideoDataset]:
     video_root = Path(video_dir)
     dataset: List[VideoDataset] = []
 
     if output_path is None:
-        output_path = PROCESSED_OUTPUT_DIR / "complete_dataset.json"
+        output_path = UNIFIED_OUTPUT_DIR / "youtube" / "complete_dataset.json"
 
     if not video_root.exists():
         print(f"⚠️  Video root not found: {video_root}")
@@ -456,7 +696,7 @@ def build_dataset(
 
     playlist_dirs = [p for p in video_root.iterdir() if p.is_dir()]
     if playlist_filter:
-        playlist_dirs = [p for p in playlist_dirs if p.name == playlist_filter]
+        playlist_dirs = [p for p in playlist_dirs if p.name in playlist_filter]
     
     # Process YouTube playlists
     for playlist_dir in sorted(playlist_dirs):
@@ -476,6 +716,12 @@ def build_dataset(
 
         for batch in chunked(video_paths, batch_size):
             for video_path in batch:
+                # Skip if already processed
+                feature_file = UNIFIED_OUTPUT_DIR / "youtube" / "features" / f"{video_path.stem}_features.json"
+                if feature_file.exists():
+                    print(f"   Skipping {video_path.name} (already processed)")
+                    continue
+
                 print(f"\nProcessing: {video_path.name}")
                 try:
                     audio_path = extract_audio(video_path)
@@ -483,7 +729,7 @@ def build_dataset(
                     dataset.append(video_data)
                     print(f"✓ Completed: {len(video_data.shots)} shots")
                     if save_frequency == "video":
-                        save_dataset_structure(dataset, PROCESSED_OUTPUT_DIR)
+                        save_unified_dataset_incremental(dataset)
                 except Exception as exc:
                     print(f"✗ Error processing {video_path.name}: {exc}")
                 finally:
@@ -491,35 +737,11 @@ def build_dataset(
             clear_memory()
 
         if save_frequency in {"playlist", "video"} and dataset:
-            save_dataset_structure(dataset, PROCESSED_OUTPUT_DIR)
+            save_unified_dataset_incremental(dataset)
 
-    # Process UGC dataset if requested
-    if include_ugc and RAW_UGC_DIR.exists():
-        ugc_videos = sorted(RAW_UGC_DIR.glob("*.mp4"))
-        if ugc_videos:
-            print(f"\n{'='*60}")
-            print(f"Dataset: UGC (User-Generated Content)")
-            print(f"Found {len(ugc_videos)} videos (processing all)")
-            
-            for batch in chunked(ugc_videos, batch_size):
-                for video_path in batch:
-                    print(f"\nProcessing: {video_path.name}")
-                    domain = get_ugc_domain_from_filename(video_path.name)
-                    try:
-                        audio_path = extract_audio(video_path)
-                        video_data = process_video(video_path, audio_path, domain=domain)
-                        dataset.append(video_data)
-                        print(f"✓ Completed: {len(video_data.shots)} shots (domain: {domain})")
-                        if save_frequency == "video":
-                            save_dataset_structure(dataset, PROCESSED_OUTPUT_DIR)
-                    except Exception as exc:
-                        print(f"✗ Error processing {video_path.name}: {exc}")
-                    finally:
-                        clear_memory()
-                clear_memory()
-            
-            if save_frequency in {"playlist", "video"} and dataset:
-                save_dataset_structure(dataset, PROCESSED_OUTPUT_DIR)
+    # Apply pseudo-labels to YouTube videos before saving
+    if dataset:
+        dataset = apply_pseudo_labels_youtube(dataset, top_k_ratio=0.15)
 
     if output_path:
         output_path = Path(output_path)
@@ -533,21 +755,197 @@ def build_dataset(
     return dataset
 
 
-def get_ugc_domain_from_filename(filename: str) -> str:
-    """Extract domain from UGC filename pattern (Gaming_*, Sports_*, Vlog_*)."""
-    if filename.startswith("Gaming_"):
-        return "gaming"
-    elif filename.startswith("Sports_"):
-        return "sports"
-    elif filename.startswith("Vlog_"):
-        return "vlog"
+# ============================================================================
+# TVSum & SumMe Dataset Loaders
+# ============================================================================
+
+
+def load_tvsumme_dataset(json_file: Path, video_path: Optional[Path] = None, audio_path: Optional[Path] = None, domain: str = "tvsum") -> Optional[List[VideoDataset]]:
+    """
+    Load TVSum/SumMe JSON with ground-truth importance scores.
+    Extract 14D features from video/audio if provided, otherwise use defaults.
+    Normalize per-video and assign as labels.
+    
+    Expected format:
+    {
+      "video_id": "...",
+      "duration": 300,
+      "shots": [
+        {"start": 0, "end": 1.5, "user_summary": [0, 1, 0, ...], "features": {...}},
+        ...
+      ]
+    }
+    """
+    try:
+        with open(json_file) as f:
+            video_data = json.load(f)
+    except Exception as e:
+        print(f"Error loading {json_file}: {e}")
+        return None
+
+    shots_list = video_data.get("shots", [])
+    if not shots_list:
+        return None
+
+    # Extract importance scores from user summaries
+    importance_scores = []
+    for shot in shots_list:
+        user_summary = shot.get("user_summary", [])
+        if user_summary:
+            importance = float(np.mean(user_summary))
+        else:
+            importance = shot.get("importance", 0.0)
+        importance_scores.append(importance)
+
+    # Normalize per-video
+    scores = np.array(importance_scores)
+    if scores.max() - scores.min() > 1e-6:
+        scores_norm = (scores - scores.min()) / (scores.max() - scores.min())
     else:
-        return "default"
+        scores_norm = scores
+
+    # Determine if we can extract features from video
+    can_extract_features = video_path is not None and audio_path is not None and video_path.exists() and audio_path.exists()
+    
+    if can_extract_features:
+        print(f"    Extracting 14D features from {video_path.stem}...")
+    else:
+        if video_path or audio_path:
+            print(f"    Warning: Video or audio path missing/invalid, using default features")
+
+    # Build shots with extracted or default features
+    shots = []
+    for i, (shot_data, label) in enumerate(zip(shots_list, scores_norm)):
+        start = float(shot_data.get("start", 0))
+        end = float(shot_data.get("end", 1))
+        
+        # Try to extract real features from video/audio
+        if can_extract_features:
+            try:
+                features = extract_shot_features(
+                    video_path, audio_path, start, end, domain,
+                    shot_index=i, total_shots=len(shots_list)
+                )
+            except Exception as e:
+                print(f"      Warning: Feature extraction failed for shot {i}: {e}. Using defaults.")
+                features = ShotFeatures(
+                    duration=end - start,
+                    relative_position=i / max(len(shots_list), 1),
+                    motion_mean=0.0,
+                    motion_std=0.0,
+                    motion_peak=0.0,
+                    rms_energy=0.0,
+                    rms_delta=0.0,
+                    spectral_flux=0.0,
+                    pitch_mean=0.0,
+                    pitch_std=0.0,
+                    silence_ratio=0.0,
+                    scene_cut_strength=0.0,
+                    color_hist_delta=0.0,
+                )
+        else:
+            # Use default features
+            features = ShotFeatures(
+                duration=end - start,
+                relative_position=i / max(len(shots_list), 1),
+                motion_mean=0.0,
+                motion_std=0.0,
+                motion_peak=0.0,
+                rms_energy=0.0,
+                rms_delta=0.0,
+                spectral_flux=0.0,
+                pitch_mean=0.0,
+                pitch_std=0.0,
+                silence_ratio=0.0,
+                scene_cut_strength=0.0,
+                color_hist_delta=0.0,
+            )
+        
+        shots.append(Shot(start=start, end=end, features=features, label=float(label)))
+
+    duration = float(video_data.get("duration", shots_list[-1].get("end", 0) if shots_list else 0))
+    video_id = video_data.get("video_id", json_file.stem)
+
+    dataset = VideoDataset(video_id=video_id, duration=duration, domain=domain, shots=shots)
+    return [dataset]
 
 
-# ============================================================================
-# Top 5 Major YouTube Playlists Configuration
-# ============================================================================
+def load_all_tvsumme(dataset_name: str = "tvsum") -> List[VideoDataset]:
+    """Load all TVSum or SumMe videos from raw directory with unified feature extraction."""
+    raw_dir = RAW_TVSUMME_DIR if dataset_name == "tvsum" else RAW_SUMME_DIR
+    
+    # Hard-coded video directories
+    if dataset_name == "tvsum":
+        video_dir = Path("model/data/raw/tvsum/video")
+    else:  # summe
+        video_dir = Path("model/data/raw/summe/videos")
+    
+    if not raw_dir.exists():
+        print(f"⚠️  {dataset_name.upper()} directory not found: {raw_dir}")
+        return []
+
+    all_videos = []
+    json_files = list(raw_dir.glob("*.json"))
+    
+    if not json_files:
+        print(f"⚠️  No JSON files found in {raw_dir}")
+        return []
+
+    print(f"\nLoading {len(json_files)} {dataset_name.upper()} videos with feature extraction...")
+    print(f"   Video directory: {video_dir}")
+    
+    audio_dir = Path("model/data/raw") / dataset_name / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    
+    for json_file in sorted(json_files):
+        video_id = json_file.stem
+        print(f"\n  Processing {video_id}...")
+        
+        try:
+            # Try to find video file in the specified video directory
+            video_path = None
+            for ext in ["*.mp4", "*.avi", "*.mkv", "*.mov"]:
+                matches = list(video_dir.glob(ext))
+                for match in matches:
+                    if match.stem == video_id:
+                        video_path = match
+                        break
+                if video_path:
+                    break
+            
+            # Extract audio if video found
+            audio_path = None
+            if video_path:
+                print(f"    Found video: {video_path.name}")
+                try:
+                    audio_path = extract_audio(video_path, output_dir=str(audio_dir))
+                    if audio_path:
+                        print(f"    Extracted audio: {audio_path.name}")
+                    else:
+                        print(f"    Warning: No audio stream in video")
+                except Exception as e:
+                    print(f"    Warning: Audio extraction failed - {e}")
+            else:
+                print(f"    Warning: No video file found for {video_id}")
+            
+            # Load dataset with video/audio paths (if available)
+            videos = load_tvsumme_dataset(
+                json_file, 
+                video_path=video_path,
+                audio_path=audio_path,
+                domain=dataset_name
+            )
+            if videos:
+                all_videos.extend(videos)
+                print(f"    ✓ Loaded {len(videos[0].shots)} shots")
+            
+        except Exception as e:
+            print(f"  ✗ Error loading {video_id}: {e}")
+        
+        # Cleanup memory
+        clear_memory()
+
+    return all_videos
 
 
 TOP_5_PLAYLISTS: Dict[str, Dict[str, str]] = {
@@ -561,23 +959,198 @@ TOP_5_PLAYLISTS: Dict[str, Dict[str, str]] = {
         "domain": "documentary",
         "description": "Educational science videos",
     },
-    # "BBC-Breaking-News": {
-    #     "url": "https://www.youtube.com/playlist?list=PLS3XGZxi7cBVTzEE4Sim9UuNKnUJq9Vkh",
-    #     "domain": "documentary",
-    #     "description": "News and current events",
-    # },
+    "BBC-Breaking-News": {
+        "url": "https://www.youtube.com/playlist?list=PLS3XGZxi7cBVTzEE4Sim9UuNKnUJq9Vkh",
+        "domain": "documentary",
+        "description": "News and current events",
+    },
     "ESPN-Highlights": {
         "url": "https://www.youtube.com/playlist?list=PL87LlAF-2PIwKpIUaKO4_p5QNmjxhYUFG",
         "domain": "sports",
         "description": "Sports highlights",
     },
-    # "BBC-Learning": {
-    #     "url": "https://www.youtube.com/playlist?list=PLcetZ6gSk969oGvAI0e4_PgVnlGbm64bp",
-    #     "domain": "documentary",
-    #     "description": "BBC educational content",
-    # },
+    "BBC-Learning": {
+        "url": "https://www.youtube.com/playlist?list=PLcetZ6gSk969oGvAI0e4_PgVnlGbm64bp",
+        "domain": "documentary",
+        "description": "BBC educational content",
+    },
 }
 
+# ============================================================================
+# High-Importance Curated Videos
+# ============================================================================
+
+HIGH_IMPORTANCE_VIDEOS: Dict[str, Dict[str, str]] = {
+    "sNPnbI1arSE": {
+        "url": "https://youtu.be/sNPnbI1arSE",
+        "domain": "music",
+        "description": "Eminem - My Name Is (Official Music Video) | 4 min music video with high visual complexity",
+    },
+    "XbGs_qK2PQA": {
+        "url": "https://youtu.be/XbGs_qK2PQA",
+        "domain": "music",
+        "description": "Eminem - Rap God (Explicit) | 6 min high-motion music video with fast cuts",
+    },
+    "VQRLujxTm3c": {
+        "url": "https://youtu.be/VQRLujxTm3c",
+        "domain": "movie_trailer",
+        "description": "Grand Theft Auto VI Trailer 2 | 3 min cinematic game trailer with dynamic scenes",
+    },
+    "JfVOs4VSpmA": {
+        "url": "https://youtu.be/JfVOs4VSpmA",
+        "domain": "movie_trailer",
+        "description": "SPIDER-MAN: NO WAY HOME - Official Trailer (HD) | 3 min action movie trailer",
+    },
+    "yzr2rXRGJz8": {
+        "url": "https://youtu.be/yzr2rXRGJz8",
+        "domain": "sports",
+        "description": "Siraj Takes 5fer in UNBELIEVABLE Finish! | England v India Test Highlights | 6.5 min cricket highlights",
+    },
+    "JIRqdeNl2cU": {
+        "url": "https://youtu.be/JIRqdeNl2cU",
+        "domain": "sports",
+        "description": "Race Highlights | 2025 Dutch Grand Prix | 8 min F1 race highlights with high-speed action",
+    },
+    "s7WPMv2IgFk": {
+        "url": "https://youtu.be/s7WPMv2IgFk",
+        "domain": "movie_clip",
+        "description": "The Taliban Attack US Marines Scene | JARHEAD 2: FIELD OF FIRE (2014) | 5 min action movie clip",
+    },
+    "oq02OFHhTSE": {
+        "url": "https://youtu.be/oq02OFHhTSE",
+        "domain": "gaming",
+        "description": "low sens = god aim (CSGO2 edit) | 2.5 min competitive gaming montage with quick reflexes",
+    },
+    "8ZfBKk7YneU": {
+        "url": "https://youtu.be/8ZfBKk7YneU",
+        "domain": "gaming",
+        "description": "kyousuke - DREAM SPACE CSGO2 edit | 3 min gaming highlight reel with visual effects",
+    },
+    # Additional music videos
+    "4NRXx6U8ABQ": {
+        "url": "https://youtu.be/4NRXx6U8ABQ",
+        "domain": "music",
+        "description": "Music video with high visual complexity and dynamic scenes",
+    },
+    "WWEs82u37Mw": {
+        "url": "https://youtu.be/WWEs82u37Mw",
+        "domain": "music",
+        "description": "Music video with fast cuts and motion",
+    },
+    "_CL6n0FJZpk": {
+        "url": "https://youtu.be/_CL6n0FJZpk",
+        "domain": "music",
+        "description": "Music video with cinematic elements",
+    },
+    "H5v3kku4y6Q": {
+        "url": "https://youtu.be/H5v3kku4y6Q",
+        "domain": "music",
+        "description": "Music video with choreography and effects",
+    },
+    "suAR1PYFNYA": {
+        "url": "https://youtu.be/suAR1PYFNYA",
+        "domain": "music",
+        "description": "Music video with narrative storytelling",
+    },
+    "TUVcZfQe-Kw": {
+        "url": "https://youtu.be/TUVcZfQe-Kw",
+        "domain": "music",
+        "description": "Music video with performance elements",
+    },
+    # Additional movie trailers
+    "73_1biulkYk": {
+        "url": "https://youtu.be/73_1biulkYk",
+        "domain": "movie_trailer",
+        "description": "Movie trailer with action sequences",
+    },
+    "XJMuhwVlca4": {
+        "url": "https://youtu.be/XJMuhwVlca4",
+        "domain": "movie_trailer",
+        "description": "Movie trailer with dramatic scenes",
+    },
+    "j7jPnwVGdZ8": {
+        "url": "https://youtu.be/j7jPnwVGdZ8",
+        "domain": "movie_trailer",
+        "description": "Movie trailer with fast-paced editing",
+    },
+    "aDyQxtg0V2w": {
+        "url": "https://youtu.be/aDyQxtg0V2w",
+        "domain": "movie_trailer",
+        "description": "Movie trailer with cinematic visuals",
+    },
+    "hRFY_Fesa9Q": {
+        "url": "https://youtu.be/hRFY_Fesa9Q",
+        "domain": "movie_trailer",
+        "description": "Movie trailer with suspense and action",
+    },
+    "SzINZZ6iqxY": {
+        "url": "https://youtu.be/SzINZZ6iqxY",
+        "domain": "movie_trailer",
+        "description": "Movie trailer with dynamic scene transitions",
+    },
+    # Additional gaming montages
+    "IKYnbxX8ujk": {
+        "url": "https://youtu.be/IKYnbxX8ujk",
+        "domain": "gaming",
+        "description": "Gaming montage with competitive gameplay",
+    },
+    "a8keyU_0kJ4": {
+        "url": "https://youtu.be/a8keyU_0kJ4",
+        "domain": "gaming",
+        "description": "Gaming montage with skill highlights",
+    },
+    "Z6qUyGjFOEE": {
+        "url": "https://youtu.be/Z6qUyGjFOEE",
+        "domain": "gaming",
+        "description": "Gaming montage with fast-paced action",
+    },
+    "oyGu3fwxDwk": {
+        "url": "https://youtu.be/oyGu3fwxDwk",
+        "domain": "gaming",
+        "description": "Gaming montage with clutch moments",
+    },
+    "CoRiY1rSCCA": {
+        "url": "https://youtu.be/CoRiY1rSCCA",
+        "domain": "gaming",
+        "description": "Gaming montage with visual effects",
+    },
+    "fvSzkKLw4pE": {
+        "url": "https://youtu.be/fvSzkKLw4pE",
+        "domain": "gaming",
+        "description": "Gaming montage with synchronized edits",
+    },
+    # Additional sports highlights
+    "hGmAPvLuBOQ": {
+        "url": "https://youtu.be/hGmAPvLuBOQ",
+        "domain": "sports",
+        "description": "Sports highlights with key moments",
+    },
+    "amMJfaB5dXo": {
+        "url": "https://youtu.be/amMJfaB5dXo",
+        "domain": "sports",
+        "description": "Sports highlights with high-speed action",
+    },
+    "EPwOPr2xkYo": {
+        "url": "https://youtu.be/EPwOPr2xkYo",
+        "domain": "sports",
+        "description": "Sports highlights with dramatic plays",
+    },
+    "TthnLjCrMTg": {
+        "url": "https://youtu.be/TthnLjCrMTg",
+        "domain": "sports",
+        "description": "Sports highlights with intense competition",
+    },
+    "ZW_YxG7iz8c": {
+        "url": "https://youtu.be/ZW_YxG7iz8c",
+        "domain": "sports",
+        "description": "Sports highlights with crowd reactions",
+    },
+    "KiOAjVm5wug": {
+        "url": "https://youtu.be/KiOAjVm5wug",
+        "domain": "sports",
+        "description": "Sports highlights with game-winning moments",
+    },
+}
 
 # ============================================================================
 # Dataset Management & Testing
@@ -588,19 +1161,25 @@ def validate_dataset(dataset: List[VideoDataset]) -> Dict[str, object]:
     if not dataset:
         return {"valid": False, "error": "Empty dataset"}
 
+    all_shots = [s for v in dataset for s in v.shots]
+    labeled_shots = [s for s in all_shots if s.label is not None]
+
     stats = {
         "valid": True,
         "num_videos": len(dataset),
-        "total_shots": sum(len(v.shots) for v in dataset),
+        "total_shots": len(all_shots),
+        "labeled_shots": len(labeled_shots),
         "total_duration": sum(v.duration for v in dataset),
-        "avg_shots_per_video": sum(len(v.shots) for v in dataset) / len(dataset),
-        "avg_duration_per_video": sum(v.duration for v in dataset) / len(dataset),
+        "avg_shots_per_video": len(all_shots) / len(dataset) if dataset else 0,
+        "avg_duration_per_video": sum(v.duration for v in dataset) / len(dataset) if dataset else 0,
         "domains": list(set(v.domain for v in dataset)),
-        "importance_stats": {
-            "min": min(s.importance for v in dataset for s in v.shots),
-            "max": max(s.importance for v in dataset for s in v.shots),
-            "mean": float(np.mean([s.importance for v in dataset for s in v.shots])),
-            "std": float(np.std([s.importance for v in dataset for s in v.shots])),
+        "label_stats": {
+            "labeled": len(labeled_shots),
+            "unlabeled": len(all_shots) - len(labeled_shots),
+            "label_distribution": {
+                "0": len([s for s in labeled_shots if s.label == 0.0]),
+                "1": len([s for s in labeled_shots if s.label == 1.0]),
+            } if labeled_shots else {},
         },
     }
     return stats
@@ -616,7 +1195,10 @@ def _assign_split(idx: int) -> str:
     return "test"
 
 
-def save_dataset_structure(dataset: List[VideoDataset], output_dir: Path = PROCESSED_OUTPUT_DIR) -> Dict[str, Path]:
+def save_dataset_structure(dataset: List[VideoDataset], output_dir: Path = None) -> Dict[str, Path]:
+    if output_dir is None:
+        output_dir = UNIFIED_OUTPUT_DIR / "youtube"
+    
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -632,6 +1214,12 @@ def save_dataset_structure(dataset: List[VideoDataset], output_dir: Path = PROCE
 
     metadata_videos = []
     splits: Dict[str, List[str]] = {"train": [], "val": [], "test": []}
+    
+    # Create domain-specific subdirectories
+    domains_in_dataset = set(v.domain for v in dataset)
+    for domain in domains_in_dataset:
+        (features_dir / domain).mkdir(exist_ok=True)
+        (metadata_dir / domain).mkdir(exist_ok=True)
 
     for idx, v in enumerate(dataset):
         split = _assign_split(idx)
@@ -659,10 +1247,24 @@ def save_dataset_structure(dataset: List[VideoDataset], output_dir: Path = PROCE
     with open(metadata_file, "w") as f:
         json.dump(metadata, f, indent=2)
 
+    # Save per-domain metadata summaries
+    for domain in domains_in_dataset:
+        domain_videos = [v for v in metadata_videos if v["domain"] == domain]
+        domain_metadata = {
+            "domain": domain,
+            "num_videos": len(domain_videos),
+            "videos": domain_videos,
+            "total_shots": sum(v["num_shots"] for v in domain_videos),
+        }
+        domain_metadata_file = metadata_dir / domain / "domain_metadata.json"
+        with open(domain_metadata_file, "w") as f:
+            json.dump(domain_metadata, f, indent=2)
+
     for video in dataset:
         video_features = {
             "video_id": video.video_id,
             "duration": video.duration,
+            "domain": video.domain,
             "shots": [],
         }
         for shot in video.shots:
@@ -670,13 +1272,13 @@ def save_dataset_structure(dataset: List[VideoDataset], output_dir: Path = PROCE
                 {
                     "start": shot.start,
                     "end": shot.end,
-                    "importance": shot.importance,
+                    "label": shot.label,
                     "rank": shot.rank,
                     "features": shot.features.to_dict(),
                 }
             )
 
-        features_file = features_dir / f"{video.video_id}_features.json"
+        features_file = features_dir / video.domain / f"{video.video_id}_features.json"
         with open(features_file, "w") as f:
             json.dump(video_features, f, indent=2)
 
@@ -689,6 +1291,193 @@ def save_dataset_structure(dataset: List[VideoDataset], output_dir: Path = PROCE
         "metadata": metadata_file,
         "features_dir": features_dir,
         "splits": splits_file,
+    }
+
+
+def get_processed_video_ids(dataset_type: str = "unified") -> set:
+    """Get set of already-processed video IDs to avoid re-processing."""
+    if dataset_type == "unified":
+        combined_file = UNIFIED_OUTPUT_DIR / "combined" / "all_videos.json"
+        if not combined_file.exists():
+            return set()
+        try:
+            with open(combined_file) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return {v["video_id"] for v in data}
+                else:
+                    return {v["video_id"] for v in data.get("videos", [])}
+        except Exception:
+            return set()
+    return set()
+
+
+def load_existing_unified_dataset() -> List[VideoDataset]:
+    """Load existing unified dataset if it exists."""
+    combined_file = UNIFIED_OUTPUT_DIR / "combined" / "all_videos.json"
+    
+    if not combined_file.exists():
+        return []
+    
+    try:
+        with open(combined_file) as f:
+            data = json.load(f)
+        
+        videos = []
+        for v_dict in data:
+            shots = [
+                Shot(
+                    start=s["start"],
+                    end=s["end"],
+                    features=ShotFeatures(**s["features"]),
+                    label=s.get("label"),
+                    rank=s.get("rank")
+                )
+                for s in v_dict["shots"]
+            ]
+            videos.append(VideoDataset(
+                video_id=v_dict["video_id"],
+                duration=v_dict["duration"],
+                domain=v_dict["domain"],
+                shots=shots
+            ))
+        return videos
+    except Exception as e:
+        print(f"Warning: Could not load existing unified dataset: {e}")
+        return []
+
+
+def save_unified_dataset_incremental(all_videos: List[VideoDataset], save_every: int = 10) -> Dict[str, Path]:
+    """
+    Save unified dataset incrementally. Every 10 videos, merge into combined file.
+    Handles resumption - skips duplicates.
+    """
+    unified_root = UNIFIED_OUTPUT_DIR
+    unified_root.mkdir(parents=True, exist_ok=True)
+
+    # Create subdirectories for each source
+    for source in ["tvsum", "summe", "youtube", "combined"]:
+        source_dir = unified_root / source
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "features").mkdir(exist_ok=True)
+        (source_dir / "metadata").mkdir(exist_ok=True)
+        (source_dir / "splits").mkdir(exist_ok=True)
+
+    # Load existing unified dataset to avoid duplicates
+    existing_videos = load_existing_unified_dataset()
+    existing_ids = {v.video_id for v in existing_videos}
+    
+    # Filter new videos (skip already processed)
+    new_videos = [v for v in all_videos if v.video_id not in existing_ids]
+    
+    if new_videos:
+        print(f"\n📝 Saving {len(new_videos)} new videos (skipping {len(existing_videos)} existing)...")
+        existing_videos.extend(new_videos)
+    else:
+        print(f"\n✓ All {len(all_videos)} videos already processed")
+        existing_videos = all_videos
+
+    # Save per-source metadata and features
+    for source in ["tvsum", "summe", "youtube"]:
+        # Map videos to source: tvsum/summe match exactly, all others go to youtube
+        if source in ["tvsum", "summe"]:
+            source_videos = [v for v in existing_videos if v.domain == source]
+        else:  # source == "youtube"
+            # All non-tvsum/summe videos are YouTube (music, sports, gaming, etc.)
+            source_videos = [v for v in existing_videos if v.domain not in ["tvsum", "summe"]]
+        
+        if not source_videos:
+            continue
+
+        source_dir = unified_root / source
+        
+        # Save features
+        for video in source_videos:
+            video_data = {
+                "video_id": video.video_id,
+                "duration": video.duration,
+                "domain": video.domain,
+                "shots": [s.to_dict() for s in video.shots]
+            }
+            features_file = source_dir / "features" / f"{video.video_id}_features.json"
+            with open(features_file, "w") as f:
+                json.dump(video_data, f, indent=2)
+
+        # Save metadata
+        splits: Dict[str, List[str]] = {"train": [], "val": [], "test": []}
+        for idx, video in enumerate(source_videos):
+            split = _assign_split(idx)
+            splits[split].append(video.video_id)
+
+        metadata = {
+            "source": source,
+            "num_videos": len(source_videos),
+            "total_shots": sum(len(v.shots) for v in source_videos),
+            "videos": [
+                {
+                    "video_id": v.video_id,
+                    "duration": v.duration,
+                    "num_shots": len(v.shots),
+                    "label_stats": {
+                        "labeled": len([s for s in v.shots if s.label is not None]),
+                        "unlabeled": len([s for s in v.shots if s.label is None]),
+                    }
+                }
+                for v in source_videos
+            ]
+        }
+        
+        metadata_file = source_dir / "metadata" / "dataset_metadata.json"
+        with open(metadata_file, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        splits_file = source_dir / "splits" / "train_val_test_split.json"
+        with open(splits_file, "w") as f:
+            json.dump(splits, f, indent=2)
+
+    # Save combined dataset
+    combined_dir = unified_root / "combined"
+    all_videos_file = combined_dir / "all_videos.json"
+    
+    with open(all_videos_file, "w") as f:
+        json.dump([v.to_dict() for v in existing_videos], f, indent=2)
+
+    # Save combined statistics
+    all_shots = [s for v in existing_videos for s in v.shots]
+    labeled_shots = [s for s in all_shots if s.label is not None]
+    
+    stats = {
+        "total_videos": len(existing_videos),
+        "total_shots": len(all_shots),
+        "labeled_shots": len(labeled_shots),
+        "by_source": {},
+        "label_distribution": {
+            "0": len([s for s in labeled_shots if s.label == 0.0]),
+            "1": len([s for s in labeled_shots if s.label == 1.0]),
+        }
+    }
+
+    for source in ["tvsum", "summe", "youtube"]:
+        source_videos = [v for v in existing_videos if v.domain == source]
+        if source_videos:
+            source_shots = [s for v in source_videos for s in v.shots]
+            source_labeled = [s for s in source_shots if s.label is not None]
+            stats["by_source"][source] = {
+                "num_videos": len(source_videos),
+                "num_shots": len(source_shots),
+                "labeled": len(source_labeled),
+                "label_0": len([s for s in source_labeled if s.label == 0.0]),
+                "label_1": len([s for s in source_labeled if s.label == 1.0]),
+            }
+
+    stats_file = combined_dir / "statistics.json"
+    with open(stats_file, "w") as f:
+        json.dump(stats, f, indent=2)
+
+    return {
+        "combined_videos": all_videos_file,
+        "combined_stats": stats_file,
+        "root_dir": unified_root,
     }
 
 
@@ -716,9 +1505,9 @@ def test_dataset(dataset: List[VideoDataset]) -> bool:
         print("✗ Test 2: Some videos missing required fields")
 
     tests_total += 1
-    all_shots_valid = all(hasattr(s, "start") and hasattr(s, "end") and hasattr(s, "importance") and 0 <= s.importance <= 1 for v in dataset for s in v.shots)
+    all_shots_valid = all(hasattr(s, "start") and hasattr(s, "end") and hasattr(s, "features") for v in dataset for s in v.shots)
     if all_shots_valid:
-        print("✓ Test 3: All shots have valid structure and importance in [0,1]")
+        print("✓ Test 3: All shots have valid structure")
         tests_passed += 1
     else:
         print("✗ Test 3: Some shots have invalid structure")
@@ -732,7 +1521,7 @@ def test_dataset(dataset: List[VideoDataset]) -> bool:
         print("✗ Test 4: Some shots have invalid temporal boundaries")
 
     tests_total += 1
-    valid_domains = {"lecture", "interview", "sports", "documentary", "default"}
+    valid_domains = {"lecture", "interview", "sports", "documentary", "gaming", "music", "movie_trailer", "movie_clip", "default"}
     all_domains_valid = all(v.domain in valid_domains for v in dataset)
     if all_domains_valid:
         print("✓ Test 5: All videos have valid domain labels")
@@ -741,12 +1530,21 @@ def test_dataset(dataset: List[VideoDataset]) -> bool:
         print("✗ Test 5: Some videos have invalid domain labels")
 
     tests_total += 1
+    all_features_valid = all(hasattr(s.features, "motion_mean") and hasattr(s.features, "rms_energy") for v in dataset for s in v.shots)
+    if all_features_valid:
+        print("✓ Test 6: All shots have rich feature descriptors")
+        tests_passed += 1
+    else:
+        print("✗ Test 6: Some shots missing feature descriptors")
+
+    tests_total += 1
     stats = validate_dataset(dataset)
-    print("✓ Test 6: Dataset statistics computed")
+    print("✓ Test 7: Dataset statistics computed")
     print(f"   - Videos: {stats['num_videos']}")
     print(f"   - Total shots: {stats['total_shots']}")
     print(f"   - Avg shots/video: {stats['avg_shots_per_video']:.1f}")
-    print(f"   - Duration: {stats['total_duration']:.0f}s ({stats['total_duration']/3600:.1f}h)")
+    print(f"   - Duration: {stats['total_duration']/3600:.2f}h")
+    print(f"   - Labeled: {stats['label_stats']['labeled']} | Unlabeled: {stats['label_stats']['unlabeled']}")
     tests_passed += 1
 
     print("\n" + "=" * 70)
@@ -765,61 +1563,163 @@ if __name__ == "__main__":
     import sys
 
     print("\n" + "=" * 70)
-    print("📺 VIDEO SUMMARIZATION DATASET BUILDER (UGC Only)")
+    print("📺 UNIFIED VIDEO SUMMARIZATION DATASET BUILDER")
+    print("   (TVSum + SumMe + YouTube)")
     print("=" * 70)
 
-    # UGC-only mode
-    BASE_VIDEO_DIR = RAW_UGC_DIR
-    BASE_OUTPUT_DIR = PROCESSED_OUTPUT_DIR
-    BASE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    MAX_VIDEOS_PER_PLAYLIST = None  # Process all UGC videos
+    # Unified dataset mode
+    UNIFIED_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    MAX_VIDEOS_PER_PLAYLIST = 10
 
-    target_playlist = sys.argv[1] if len(sys.argv) > 1 else None
-    save_frequency = sys.argv[2] if len(sys.argv) > 2 else "playlist"
+    # Parse command-line arguments
+    target_playlists = []
+    save_frequency = "playlist"
+    skip_high_importance = False
+    skip_playlists = False
+    skip_tvsumme = False
     
-    if save_frequency not in {"playlist", "video"}:
-        save_frequency = "playlist"
+    for arg in sys.argv[1:]:
+        if arg == "--include-curated":
+            skip_high_importance = False
+        elif arg in {"--skip-high-importance", "--skip-curated"}:
+            skip_high_importance = True
+        elif arg in {"--only-curated", "--curated-only"}:
+            skip_high_importance = False
+            skip_playlists = True
+        elif arg == "--skip-tvsumme":
+            skip_tvsumme = True
+        elif arg == "--only-tvsumme":
+            skip_high_importance = True
+            skip_playlists = True
+        elif arg in {"playlist", "video"}:
+            save_frequency = arg
+        elif not arg.startswith("--"):
+            target_playlists.append(arg)
+    
+    if target_playlists and "--include-curated" not in sys.argv:
+        skip_high_importance = True
 
-    print("✓ Processing UGC dataset only (Gaming, Sports, Vlog)\n")
+    all_datasets = []
 
-    all_datasets = build_dataset(
-        video_dir=BASE_VIDEO_DIR,
-        output_path=BASE_OUTPUT_DIR / "complete_dataset.json",
-        max_per_playlist=MAX_VIDEOS_PER_PLAYLIST,
-        batch_size=3,
-        domain_map=TOP_5_PLAYLISTS,
-        playlist_filter=target_playlist,
-        save_frequency=save_frequency,
-        include_ugc=False,  # UGC is primary source now
-    )
+    # Load TVSum & SumMe (if not skipped)
+    if not skip_tvsumme:
+        print("\n✓ Loading TVSum & SumMe datasets...\n")
+        all_datasets.extend(load_all_tvsumme("tvsum"))
+        all_datasets.extend(load_all_tvsumme("summe"))
+        
+        # Save TVSum/SumMe to unified dataset
+        if all_datasets:
+            print(f"\n💾 Saving TVSum/SumMe datasets ({len(all_datasets)} videos)...")
+            save_unified_dataset_incremental(all_datasets)
+            print(f"✓ Saved to unified dataset structure")
+    else:
+        print("\n⏭️  Skipping TVSum & SumMe datasets\n")
+    
+    # Process high-importance curated videos (unless skipped)
+    if not skip_high_importance:
+        print("\n✓ Processing High-Importance Curated Videos\n")
+        print(f"{'='*70}")
+        print(f"Playlist: HIGH_IMPORTANCE_VIDEOS")
+        print(f"Found {len(HIGH_IMPORTANCE_VIDEOS)} videos")
+        print(f"{'='*70}\n")
+    
+        for video_id, video_info in HIGH_IMPORTANCE_VIDEOS.items():
+            video_url = video_info["url"]
+            domain = video_info["domain"]
+            
+            # Skip if already in unified dataset
+            existing_ids = {v.video_id for v in all_datasets}
+            if video_id in existing_ids:
+                print(f"   Skipping {video_id} (already processed)")
+                continue
+
+            print(f"\nProcessing: {video_id} ({domain})")
+            
+            try:
+                video_path = download_individual_video(video_url, video_id, RAW_YOUTUBE_DIR)
+                if video_path and video_path.exists():
+                    audio_path = extract_audio(video_path)
+                    if audio_path:
+                        video_data = process_video(video_path, audio_path, domain=domain)
+                        all_datasets.append(video_data)
+                        print(f"✓ Completed: {len(video_data.shots)} shots")
+                        
+                        # Incremental save after EVERY video to prevent data loss
+                        print(f"💾 Saving progress ({len(all_datasets)} videos)...")
+                        save_unified_dataset_incremental(all_datasets)
+                        print(f"✓ Saved to unified dataset (tvsum/summe/youtube/combined with features/metadata/splits)")
+                    else:
+                        print(f"⚠️ No audio found in {video_id}")
+                else:
+                    print(f"✗ Failed to download {video_id}")
+            except Exception as exc:
+                print(f"✗ Error processing {video_id}: {exc}")
+            finally:
+                clear_memory()
+    else:
+        print("\n⏭️  Skipping high-importance curated videos\n")
+    
+    # Process YouTube playlists (unless skipped)
+    if not skip_playlists:
+        print("\n✓ Processing YouTube Playlists\n")
+        youtube_datasets = build_dataset(
+            video_dir=RAW_YOUTUBE_DIR,
+            output_path=None,
+            max_per_playlist=MAX_VIDEOS_PER_PLAYLIST,
+            batch_size=3,
+            domain_map=TOP_5_PLAYLISTS,
+            playlist_filter=target_playlists if target_playlists else None,
+            save_frequency=save_frequency,
+        )
+        all_datasets.extend(youtube_datasets)
+    else:
+        print("\n✓ Skipping YouTube Playlists (processing curated videos only)\n")
 
     if all_datasets:
         print("\n" + "=" * 70)
-        print("DATASET VALIDATION & STORAGE")
+        print("FINAL DATASET VALIDATION & UNIFIED STORAGE")
         print("=" * 70)
 
         is_valid = test_dataset(all_datasets)
 
         if is_valid:
-            print("\n💾 Saving dataset structure...")
-            saved_paths = save_dataset_structure(all_datasets, PROCESSED_OUTPUT_DIR)
+            print("\n💾 Saving unified dataset...")
+            
+            # Apply pseudo-labels to YouTube if not already labeled
+            for video in all_datasets:
+                if video.domain == "youtube":
+                    for shot in video.shots:
+                        if shot.label is None:
+                            shot.label = 0.0
+            
+            # Save with incremental/merge approach
+            saved_paths = save_unified_dataset_incremental(all_datasets)
 
-            print("\n✓ Dataset saved successfully!")
-            for name, path in saved_paths.items():
-                print(f"   {name}: {path}")
+            print("\n✓ Unified dataset saved successfully!")
+            print(f"   Root: {saved_paths['root_dir']}")
+            print(f"   Combined videos: {saved_paths['combined_videos']}")
+            print(f"   Statistics: {saved_paths['combined_stats']}")
 
-            stats = validate_dataset(all_datasets)
+            # Load and display final statistics
+            with open(saved_paths['combined_stats']) as f:
+                stats = json.load(f)
+
             print("\n" + "=" * 70)
-            print("📊 FINAL DATASET STATISTICS")
+            print("📊 UNIFIED DATASET STATISTICS")
             print("=" * 70)
-            print(f"Videos: {stats['num_videos']}")
+            print(f"Total videos: {stats['total_videos']}")
             print(f"Total shots: {stats['total_shots']}")
-            print(f"Total duration: {stats['total_duration']/3600:.2f} hours")
-            print(f"Avg shots/video: {stats['avg_shots_per_video']:.1f}")
-            print(f"Avg duration/video: {stats['avg_duration_per_video']:.0f}s")
-            print(f"Domains: {', '.join(stats['domains'])}")
-            print(f"Importance range: [{stats['importance_stats']['min']:.3f}, {stats['importance_stats']['max']:.3f}]")
-            print(f"Mean importance: {stats['importance_stats']['mean']:.3f} ± {stats['importance_stats']['std']:.3f}")
+            print(f"Total labeled: {stats['labeled_shots']}")
+            
+            print(f"\nBy source:")
+            for source in ["tvsum", "summe", "youtube"]:
+                if source in stats["by_source"]:
+                    src_stats = stats["by_source"][source]
+                    print(f"  {source.upper():<10} Videos: {src_stats['num_videos']:>4} | Shots: {src_stats['num_shots']:>5} | Labeled: {src_stats['labeled']:>5} | Label 0: {src_stats['label_0']:>5} | Label 1: {src_stats['label_1']:>5}")
+            
+            print(f"\nLabel distribution (all):")
+            print(f"  Label 0 (negative): {stats['label_distribution']['0']}")
+            print(f"  Label 1 (positive): {stats['label_distribution']['1']}")
             print("=" * 70 + "\n")
         else:
             print("\n✗ Dataset validation failed!")
@@ -827,9 +1727,17 @@ if __name__ == "__main__":
     else:
         print("\n⚠️  No datasets were successfully created!")
         print("\nUsage:")
-        print("  python youtube_dataset.py                 # Process all UGC videos")
-        print("  python youtube_dataset.py <domain>        # Process specific domain (Gaming, Sports, Vlog)")
-        print("\nAvailable UGC domains:")
-        print("  - Gaming   (35 videos, high motion)")
-        print("  - Sports   (55 videos, dynamic scenes)")
-        print("  - Vlog     (35 videos, speech-heavy)")
+        print("  python youtube_dataset.py                                    # TVSum + SumMe + all playlists")
+        print("  python youtube_dataset.py --skip-tvsumme                    # YouTube only")
+        print("  python youtube_dataset.py --only-tvsumme                    # TVSum + SumMe only")
+        print("  python youtube_dataset.py --only-curated                    # Curated YouTube only")
+        print("  python youtube_dataset.py TED-Talks --include-curated       # Curated + specific playlist")
+        print("\n  (Re-run at any time to resume from checkpoint)")
+        print("\nOutput structure:")
+        print("  model/data/processed/unified_dataset/")
+        print("  ├── tvsum/          (TVSum features)")
+        print("  ├── summe/          (SumMe features)")
+        print("  ├── youtube/        (YouTube features)")
+        print("  └── combined/       (Merged dataset + statistics)")
+
+

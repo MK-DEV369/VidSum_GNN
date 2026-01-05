@@ -74,9 +74,13 @@ class Summary(Base):
 
     summary_id = Column(String, primary_key=True, index=True)
     video_id = Column(String, ForeignKey("videos.video_id"), nullable=False, index=True)
-    type = Column(String, index=True) # keyframes, clips
+    type = Column(String, index=True) # keyframes, clips, text
     duration = Column(Float)
-    path = Column(String)
+    video_path = Column(String)  # Path to summary video file
+    text_summary_bullet = Column(Text)  # Bullet point format
+    text_summary_structured = Column(Text)  # Structured format
+    text_summary_plain = Column(Text)  # Plain text format
+    summary_style = Column(String)  # balanced, visual, audio, highlight
     generated_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     config_json = Column(JSON)
 

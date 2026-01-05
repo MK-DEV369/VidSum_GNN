@@ -1,6 +1,6 @@
 import torch
 import torchaudio
-from transformers import HubertModel, HubertProcessor
+from transformers import HubertModel, Wav2Vec2FeatureExtractor
 from typing import List
 import numpy as np
 
@@ -12,7 +12,7 @@ class AudioEncoder:
     """
     def __init__(self, model_name: str = "facebook/hubert-base-ls960", device: str = None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.processor = HubertProcessor.from_pretrained(model_name)
+        self.processor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
         self.model = HubertModel.from_pretrained(model_name).to(self.device)
         self.model.eval()
         # Freeze parameters for transfer learning

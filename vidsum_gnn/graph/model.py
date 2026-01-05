@@ -4,67 +4,98 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv
 
 class VidSumGNN(nn.Module):
+    """
+    Graph Attention Network for Video Summarization
+    Optimizations: pre-norm residuals, GELU activations, dropout, and safe init.
+    """
+    
     def __init__(
         self, 
-        in_dim: int, 
+        in_dim: int = 1536,
         hidden_dim: int = 1024, 
         num_heads: int = 8, 
-        dropout: float = 0.2,
-        edge_dim: int = 4
+        dropout: float = 0.2
     ):
         super().__init__()
         
-        # Input projection
-        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        # Safety check: hidden_dim must be divisible by num_heads
+        assert hidden_dim % num_heads == 0, \
+            f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})"
         
-        # GATv2 Layer 1
-        # heads * out_channels = hidden_dim usually, or we project.
-        # Spec: 8 heads, 128 per head -> 1024 total.
+        # Core blocks
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        
+        # GATv2 layers (outputs hidden_dim when concat=True and head_dim=hidden_dim//num_heads)
         head_dim = hidden_dim // num_heads
         self.gat1 = GATv2Conv(
-            hidden_dim, 
-            head_dim, 
-            heads=num_heads, 
-            dropout=dropout, 
-            edge_dim=edge_dim,
-            concat=True
+            hidden_dim, head_dim, heads=num_heads, dropout=dropout, concat=True
         )
+        self.norm2 = nn.LayerNorm(hidden_dim)
         
-        # GATv2 Layer 2
         self.gat2 = GATv2Conv(
-            hidden_dim, # input is heads*head_dim = 1024
-            head_dim, 
-            heads=num_heads, 
-            dropout=dropout, 
-            edge_dim=edge_dim,
-            concat=True
+            hidden_dim, head_dim, heads=num_heads, dropout=dropout, concat=True
         )
+        self.norm3 = nn.LayerNorm(hidden_dim)
         
-        # Readout / Scoring
-        self.mlp = nn.Sequential(
+        # Scoring head (raw scores, no sigmoid for better gradients)
+        self.scorer = nn.Sequential(
             nn.Linear(hidden_dim, 512),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(512, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Sigmoid()
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 1)
         )
-
-    def forward(self, x, edge_index, edge_attr):
-        # x: (N, in_dim)
-        x = self.input_proj(x)
-        x = F.elu(x)
         
-        # Layer 1
-        x = self.gat1(x, edge_index, edge_attr=edge_attr)
-        x = F.elu(x)
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        # Robust initialization
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        for m in self.scorer:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+        # PyG convs have their own reset
+        if hasattr(self.gat1, 'reset_parameters'):
+            self.gat1.reset_parameters()
+        if hasattr(self.gat2, 'reset_parameters'):
+            self.gat2.reset_parameters()
+    
+    def forward(self, x, edge_index, edge_attr=None):
+        """
+        Args:
+            x: Node features [num_nodes, in_dim]
+            edge_index: Graph connectivity [2, num_edges]
+            edge_attr: Edge features (optional, not used in current architecture)
+        Returns:
+            scores: Importance scores [num_nodes] (1D tensor matching labels)
+        """
+        # Input block (pre-norm + residual style)
+        h = self.input_proj(x)
+        h = self.norm1(h)
+        h = self.act(h)
+        h = self.drop(h)
         
-        # Layer 2
-        x = self.gat2(x, edge_index, edge_attr=edge_attr)
-        x = F.elu(x)
+        # GAT Layer 1
+        h1 = self.gat1(h, edge_index)
+        h1 = self.norm2(h1)
+        h1 = self.act(h1)
+        h1 = self.drop(h1)
+        h = h + h1
         
-        # Scoring
-        scores = self.mlp(x) # (N, 1)
+        # GAT Layer 2
+        h2 = self.gat2(h, edge_index)
+        h2 = self.norm3(h2)
+        h2 = self.act(h2)
+        h2 = self.drop(h2)
+        h = h + h2
         
+        # Scoring - CRITICAL: squeeze to match label shape [num_nodes]
+        scores = self.scorer(h).squeeze(-1)
         return scores

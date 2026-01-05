@@ -12,10 +12,9 @@ from vidsum_gnn.features.visual import VisualEncoder
 from vidsum_gnn.features.audio import AudioEncoder
 from vidsum_gnn.graph.builder import GraphBuilder
 from vidsum_gnn.graph.model import VidSumGNN
-from vidsum_gnn.summary.selector import ShotSelector
-from vidsum_gnn.summary.assembler import assemble_summary
 from vidsum_gnn.core.config import settings
 from vidsum_gnn.utils.logging import get_logger
+from vidsum_gnn.inference.service import get_inference_service  # NEW: Use refactored service
 
 logger = get_logger(__name__)
 
@@ -99,34 +98,24 @@ async def process_video_task(video_id: str, config: dict):
             audio_dir = os.path.join(settings.PROCESSED_DIR, video_id, "audio")
             os.makedirs(audio_dir, exist_ok=True)
             
-            # Limit audio extraction for speed in prototype if many shots
-            # We'll do it for all but maybe sequentially or batched
+            # Extract audio segments from video
             for i, (start, end) in enumerate(shots_times):
-                path = os.path.join(audio_dir, f"shot_{i:04d}.wav")
-                # await extract_audio_segment(canonical_path, start, end, path)
-                # Mocking audio extraction for speed in this generated code
-                # In real run, uncomment above.
-                # creating dummy file
-                with open(path, 'wb') as f: f.write(b'RIFF....WAVEfmt ...') 
+                path = os.path.join(audio_dir, f"shot_{i:04d}.mp3")
+                await extract_audio_segment(canonical_path, start, end, path)
                 audio_paths.append(path)
 
             # Encoders
             vis_encoder = VisualEncoder()
             aud_encoder = AudioEncoder() # This will fail on dummy files, so we need real files or mock
             
-            # Mocking features for prototype stability without real media
-            # In real system, we'd run:
-            # vis_feats = vis_encoder.encode(keyframe_paths)
-            # aud_feats = aud_encoder.encode(audio_paths)
-            
-            num_shots = len(shots_data)
-            vis_feats = torch.randn(num_shots, 768)
-            aud_feats = torch.randn(num_shots, 768) # Wav2Vec2 base is 768
+            # Extract visual and audio features
+            vis_feats = vis_encoder.encode(keyframe_paths)
+            aud_feats = aud_encoder.encode(audio_paths)
             
             # Fuse: Concat
             features = torch.cat([vis_feats, aud_feats], dim=1) # (N, 1536)
             
-            # 5. Graph & GNN
+            # 5. Graph & GNN with NEW InferenceService
             video.status = "gnn_inference"
             await db.commit()
             await _send_log(video_id, "Running GNN inference", stage="gnn_inference", progress=70)
@@ -134,46 +123,79 @@ async def process_video_task(video_id: str, config: dict):
             builder = GraphBuilder()
             graph_data = builder.build_graph(shots_data, features)
             
-            # Model
-            # Input dim = 1536
-            model = VidSumGNN(in_dim=1536)
-            # Load weights if available, else random init for prototype
+            # Get NEW inference service and process video end-to-end
+            inference_service = get_inference_service()
+            summary_type = config.get("summary_type", "balanced")
+            text_length = config.get("text_length", "medium")
+            summary_format = config.get("summary_format", "bullet")
             
-            with torch.no_grad():
-                scores = model(graph_data.x, graph_data.edge_index, graph_data.edge_attr)
-                scores = scores.squeeze().tolist()
-                if isinstance(scores, float): scores = [scores]
-                
-            # 6. Summary Assembly
-            video.status = "assembling"
+            await _send_log(video_id, "Generating importance scores and text summary", stage="gnn_inference", progress=75)
+            
+            # Run full pipeline: GNN + Text Summarization
+            gnn_scores, text_summary = inference_service.process_video_pipeline(
+                node_features=graph_data.x,
+                edge_index=graph_data.edge_index,
+                audio_paths=audio_paths,
+                summary_type=summary_type,
+                text_length=text_length,
+                summary_format=summary_format
+            )
+            
+            # Convert tensor scores to list
+            scores = gnn_scores.squeeze().tolist()
+            if isinstance(scores, float):
+                scores = [scores]
+            
+            # Store importance scores in shot records
+            for i, shot_data in enumerate(shots_data):
+                shot = Shot(**shot_data)
+                if i < len(scores):
+                    shot.importance_score = scores[i]
+                db.add(shot)
             await db.commit()
-            
-            selector = ShotSelector(strategy=config.get("selection_method", config.get("strategy", "greedy")))
-            target_duration = config.get("target_duration", 60)
-            await _send_log(video_id, f"Selecting shots (strategy={selector.strategy})", stage="assembling", progress=80)
-            
-            selected_shots = selector.select(shots_data, scores, target_duration)
-            
-            summary_filename = f"summary_{video_id}.mp4"
-            output_path = os.path.join(settings.OUTPUT_DIR, summary_filename)
-            
-            await assemble_summary(canonical_path, selected_shots, output_path)
+                
+            # 6. Text Summary Generation
+            await _send_log(video_id, "Generating text summaries", stage="assembling", progress=80)
             
             # 7. Finalize
             video.status = "completed"
-            await _send_log(video_id, "Summary assembled", stage="completed", progress=95)
+            await _send_log(video_id, "Processing complete", stage="completed", progress=95)
             
-            # Save summary record
+            # Save summary record with text summary in all three formats
+            # (Generate all formats regardless of user choice for future retrieval)
+            summary_text = text_summary  # This is the selected format
+            
+            # Generate other formats for storage
+            all_formats = {}
+            for fmt in ["bullet", "structured", "plain"]:
+                _, fmt_summary = inference_service.process_video_pipeline(
+                    node_features=graph_data.x,
+                    edge_index=graph_data.edge_index,
+                    audio_paths=audio_paths,
+                    summary_type=summary_type,
+                    text_length=text_length,
+                    summary_format=fmt
+                )
+                all_formats[fmt] = fmt_summary
+            
             summary = Summary(
                 summary_id=f"sum_{video_id}",
                 video_id=video_id,
-                type="clips",
-                duration=sum(s['duration_sec'] for s in selected_shots),
-                path=output_path,
+                type="text_only",
+                duration=0,
+                video_path=None,
+                text_summary_bullet=all_formats["bullet"],
+                text_summary_structured=all_formats["structured"],
+                text_summary_plain=all_formats["plain"],
+                summary_style=summary_type,
                 config_json=config
             )
             db.add(summary)
             await db.commit()
+            
+            # Log text summary preview
+            summary_preview = text_summary[:200] if text_summary else "No summary"
+            await _send_log(video_id, f"Text summary generated: {summary_preview}...", stage="completed", progress=98)
             await _send_log(video_id, "Processing complete", level="SUCCESS", stage="completed", progress=100)
             
         except Exception as e:

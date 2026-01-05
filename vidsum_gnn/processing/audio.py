@@ -12,10 +12,11 @@ async def extract_audio_segment(video_path: str, start: float, end: float, outpu
         "-ss", str(start),
         "-i", video_path,
         "-t", str(duration),
-        "-vn", # No video
-        "-acodec", "pcm_s16le",
-        "-ar", "16000", # 16kHz for Wav2Vec2
-        "-ac", "1", # Mono
+        "-vn",  # No video
+        "-c:a", "libmp3lame",  # MP3 codec - more reliable than pcm
+        "-b:a", "128k",
+        "-ar", "16000",  # 16kHz for Whisper
+        "-ac", "1",  # Mono
         "-y",
         output_path
     ]
@@ -40,7 +41,8 @@ async def extract_full_audio(video_path: str, output_path: str) -> str:
         "ffmpeg",
         "-i", video_path,
         "-vn",
-        "-acodec", "pcm_s16le",
+        "-c:a", "libmp3lame",  # MP3 codec - more reliable
+        "-b:a", "128k",
         "-ar", "16000",
         "-ac", "1",
         "-y",

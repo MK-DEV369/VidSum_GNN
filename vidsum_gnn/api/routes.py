@@ -33,8 +33,10 @@ async def broadcast_log(request: Request, video_id: str, log_data: dict):
 async def upload_video(
     request: Request,
     file: UploadFile = File(...),
-    target_duration: int = 60,
-    selection_method: str = "greedy",
+    text_length: str = "medium",
+    summary_format: str = "bullet",
+    summary_type: str = "balanced",
+    generate_video: bool = False,
     background_tasks: BackgroundTasks = BackgroundTasks(),
     db: AsyncSession = Depends(get_db)
 ):
@@ -63,8 +65,8 @@ async def upload_video(
             video_id=video_id,
             filename=filename,
             status="processing",
-            target_duration=target_duration,
-            selection_method=selection_method
+            target_duration=60,  # Default for video if generated
+            selection_method="greedy"
         )
         db.add(video)
         await db.commit()
@@ -73,7 +75,7 @@ async def upload_video(
         await broadcast_log(request, video_id, {
             "timestamp": __import__('datetime').datetime.now().isoformat(),
             "level": "SUCCESS",
-            "message": f"Upload complete. Starting processing with target_duration={target_duration}s, method={selection_method}",
+            "message": f"Upload complete. Starting processing ({summary_type}, {text_length} text, {'with' if generate_video else 'no'} video)",
             "stage": "UPLOAD",
             "progress": 15
         })
@@ -84,8 +86,12 @@ async def upload_video(
                 process_video_task,
                 video_id,
                 {
-                    "target_duration": target_duration,
-                    "selection_method": selection_method
+                    "text_length": text_length,
+                    "summary_format": summary_format,
+                    "summary_type": summary_type,
+                    "generate_video": generate_video,
+                    "target_duration": 60,  # Default for video generation
+                    "selection_method": "greedy"
                 }
             )
         
@@ -158,3 +164,51 @@ async def list_videos(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Video))
     videos = result.scalars().all()
     return videos
+
+@router.get("/summary/{video_id}/text")
+async def get_text_summary(video_id: str, format: str = "bullet", db: AsyncSession = Depends(get_db)):
+    """Get text summary for a video in specified format"""
+    result = await db.execute(
+        select(Summary).where(Summary.video_id == video_id)
+    )
+    summary = result.scalar_one_or_none()
+    
+    if not summary:
+        raise HTTPException(status_code=404, detail="Text summary not found")
+    
+    # Return appropriate format
+    summary_map = {
+        "bullet": summary.text_summary_bullet,
+        "structured": summary.text_summary_structured,
+        "plain": summary.text_summary_plain
+    }
+    
+    return {
+        "video_id": video_id,
+        "summary": summary_map.get(format, summary.text_summary_bullet),
+        "format": format,
+        "style": summary.summary_style
+    }
+
+@router.get("/download/{video_id}")
+async def download_summary_video(video_id: str, db: AsyncSession = Depends(get_db)):
+    """Download the generated summary video"""
+    result = await db.execute(
+        select(Summary).where(Summary.video_id == video_id)
+    )
+    summary = result.scalar_one_or_none()
+    
+    if not summary or not summary.video_path:
+        raise HTTPException(status_code=404, detail="Summary video not found")
+    
+    from pathlib import Path
+    video_path = Path(summary.video_path)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Summary video file not found")
+    
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        path=str(video_path),
+        media_type="video/mp4",
+        filename=f"summary_{video_id}.mp4"
+    )

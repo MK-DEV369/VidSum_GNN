@@ -1,0 +1,21 @@
+{
+  "name": "ann_project",
+  "version": "1.0.0",
+  "description": "> **AI-Powered Video Summarization with GNN-Based Scene Understanding**\r > \r > A minimalistic, single-backend video summarization system that models video content as graphs instead of sequences, enabling intelligent scene selection through Graph Neural Networks.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MK-DEV369/VidSum_GNN.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/MK-DEV369/VidSum_GNN/issues"
+  },
+  "homepage": "https://github.com/MK-DEV369/VidSum_GNN#readme"
+}

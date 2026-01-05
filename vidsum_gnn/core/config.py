@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     PROCESSED_DIR: str = os.path.join(os.getcwd(), "data", "processed")
     OUTPUT_DIR: str = os.path.join(os.getcwd(), "data", "outputs")
     TEMP_DIR: str = os.path.join(os.getcwd(), "data", "temp")
-
+    MODEL_DIR: str = os.path.join(os.getcwd(), "model", "models")
     # Model Defaults
     CHUNK_DURATION: int = 300  # 5 minutes
     CHUNK_OVERLAP: int = 30    # 30 seconds overlap

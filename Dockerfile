@@ -6,10 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
-# ffmpeg is crucial for video processing
+# Remove conda ffmpeg (missing libx264) and install system ffmpeg with x264 support
+RUN conda uninstall -y ffmpeg || true
+ENV PATH=/usr/bin:$PATH
 RUN apt-get update && apt-get install -y \
     ffmpeg \
+    libavcodec-extra \
+    libx264-dev \
+    x264 \
     git \
     build-essential \
     libsndfile1 \

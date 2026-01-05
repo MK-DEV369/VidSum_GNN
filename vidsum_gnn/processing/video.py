@@ -90,13 +90,13 @@ async def transcode_video(input_path: str, output_path: str = None) -> str:
         logger.info(f"Using existing transcoded file: {output_path}")
         return output_path
 
+    # Try libopenh264 first (available in your build), then fall back to mpeg4 or copy
     primary_cmd = [
         "ffmpeg",
         "-i", input_path,
-        "-c:v", "libx264",
-        "-b:v", "3M",
-        "-maxrate", "3M",
-        "-bufsize", "6M",
+        "-c:v", "libopenh264",
+        "-b:v", "2M",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
@@ -109,6 +109,19 @@ async def transcode_video(input_path: str, output_path: str = None) -> str:
         "-i", input_path,
         "-c:v", "mpeg4",
         "-qscale:v", "2",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-y",
+        output_path
+    ]
+    
+    # If input is already h264, just copy it
+    copy_cmd = [
+        "ffmpeg",
+        "-i", input_path,
+        "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
@@ -132,90 +145,34 @@ async def transcode_video(input_path: str, output_path: str = None) -> str:
             await process.wait()
             raise RuntimeError(f"ffmpeg transcoding timed out after {timeout}s")
 
+    # First check if input is already h264 and try copying
+    try:
+        metadata = await probe_video(input_path)
+        if metadata.get('codec') == 'h264':
+            logger.info("Input is already H.264, attempting stream copy (fastest)")
+            code, _, stderr = await _run(copy_cmd)
+            if code == 0:
+                logger.info("Stream copy successful")
+                clear_memory()
+                return output_path
+            else:
+                logger.info("Stream copy failed, trying re-encode")
+    except Exception as e:
+        logger.warning(f"Could not probe video codec: {e}")
+    
+    # Try primary codec
     code, _, stderr = await _run(primary_cmd)
     if code != 0:
         err_text = stderr.decode()
-        logger.warning(f"FFmpeg primary codec failed, retrying with mpeg4. Error: {err_text}")
-        logger.info("Starting FFmpeg transcoding with fallback codec (mpeg4)")
-        # Ensure fallback sets sane pixel format
-        fallback_cmd = [
-            "ffmpeg",
-            "-i", input_path,
-            "-c:v", "mpeg4",
-            "-qscale:v", "2",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-movflags", "+faststart",
-            "-y",
-            output_path
-        ]
+        logger.warning(f"FFmpeg primary codec (libopenh264) failed, retrying with mpeg4")
+        logger.debug(f"Primary codec error: {err_text[:500]}")  # Log first 500 chars only
+        
         code, _, stderr = await _run(fallback_cmd)
         if code != 0:
-            logger.error(f"FFmpeg transcoding failed after fallback: {stderr.decode()}")
-            raise RuntimeError(f"ffmpeg transcoding failed: {stderr.decode()}")
+            logger.error(f"FFmpeg transcoding failed after fallback: {stderr.decode()[:500]}")
+            raise RuntimeError(f"ffmpeg transcoding failed with both codecs")
 
     logger.info(f"Transcoding complete: {output_path}")
-        # Detect available encoders
-        encoders_cmd = ["ffmpeg", "-hide_banner", "-encoders"]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *encoders_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            out, _ = await proc.communicate()
-            encoders_txt = out.decode()
-        except Exception:
-            encoders_txt = ""
-
-        use_openh264 = "libopenh264" in encoders_txt
-        use_libx264 = "libx264" in encoders_txt
-
-        if use_openh264:
-            logger.info("Starting FFmpeg transcoding with primary codec (libopenh264)")
-            primary_cmd = [
-                "ffmpeg",
-                "-i", input_path,
-                "-c:v", "libopenh264",
-                "-b:v", "3M",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-movflags", "+faststart",
-                "-y",
-                output_path
-            ]
-        elif use_libx264:
-            logger.info("Starting FFmpeg transcoding with primary codec (libx264)")
-            primary_cmd = [
-                "ffmpeg",
-                "-i", input_path,
-                "-c:v", "libx264",
-                "-b:v", "3M",
-                "-maxrate", "3M",
-                "-bufsize", "6M",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-movflags", "+faststart",
-                "-y",
-                output_path
-            ]
-        else:
-            logger.info("Starting FFmpeg transcoding with fallback codec (mpeg4)")
-            primary_cmd = [
-                "ffmpeg",
-                "-i", input_path,
-                "-c:v", "mpeg4",
-                "-qscale:v", "2",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-movflags", "+faststart",
-                "-y",
-                output_path
-            ]
     clear_memory()  # Clear memory after transcoding
     return output_path
 

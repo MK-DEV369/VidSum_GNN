@@ -54,7 +54,8 @@ class StructuredLogger:
         stage: Optional[PipelineStage] = None,
         progress: Optional[float] = None,
         batch_info: Optional[Dict[str, Any]] = None,
-        extra: Optional[Dict[str, Any]] = None
+        extra: Optional[Dict[str, Any]] = None,
+        exc_info: bool = False
     ):
         """
         Log a structured message.
@@ -66,6 +67,7 @@ class StructuredLogger:
             progress: Progress percentage (0.0 - 1.0)
             batch_info: Batch processing information
             extra: Additional metadata
+            exc_info: Whether to include exception information
         """
         log_data = {
             "timestamp": datetime.utcnow().isoformat(),
@@ -79,7 +81,8 @@ class StructuredLogger:
         
         # Log to standard output
         log_func = getattr(self.logger, level.value.lower())
-        log_func(f"{message} | Stage: {stage} | Progress: {progress:.2%}" if progress else message)
+        formatted_msg = f"{message} | Stage: {stage} | Progress: {progress:.2%}" if progress else message
+        log_func(formatted_msg, exc_info=exc_info)
         
         return log_data
     
