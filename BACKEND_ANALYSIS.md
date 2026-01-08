@@ -197,7 +197,7 @@ ModelManager.get_instance().get_gnn_model(
 ### **1. Critical: GEMINI_API_KEY exposed in `.env`**
 **File**: [.env](.env)
 ```dotenv
-GEMINI_API_KEY=AIzaSyC7qMdjqVJwS9nLcVsGSq7-6gr3hFw7-7s  # ⚠️ EXPOSED
+GEMINI_API_KEY=  # ⚠️ EXPOSED
 ```
 
 **Severity**: 🔴 **CRITICAL - SECURITY RISK**
