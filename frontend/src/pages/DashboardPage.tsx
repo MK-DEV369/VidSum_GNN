@@ -163,6 +163,14 @@ export default function DashboardPage() {
     }
   };
 
+  const handleReset = () => {
+    setFile(null);
+    setTextSummary(null);
+    setState({ status: "idle", progress: 0, currentStage: "Waiting for upload...", logs: [] });
+    setVideoId("");
+    try { if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) wsRef.current.close(); } catch {}
+  };
+
   const handleUpload = async () => {
     if (!file) {
       alert("Please select a file first");
@@ -253,7 +261,7 @@ export default function DashboardPage() {
   };
 
   return (
-    <div className="h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 p-4 flex flex-col overflow-hidden" style={{ position: 'relative' }}>
+    <div className="h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 p-4 flex flex-col overflow-hidden text-white" style={{ position: 'relative' }}>
       {/* Animated Background */}
       <div style={{ position: 'fixed', inset: 0, zIndex: 0 }}>
         <FloatingLines
@@ -275,13 +283,12 @@ export default function DashboardPage() {
         <div className={`grid grid-cols-3 gap-4 transition-all ${logsExpanded ? 'h-[60%]' : 'flex-1'} overflow-hidden`}>
           {/* Upload & Controls - 1/3 width */}
           <div className="col-span-1 space-y-3 overflow-y-auto pr-2">
-            <Card>
+            <Card className="bg-white/10 border-white/20 backdrop-blur-sm">
               <CardContent className="space-y-4">
                 <div className="border-2 border-dashed border-primary/20 rounded-lg p-6 text-center cursor-pointer hover:border-primary/50 transition">
                   <label className="cursor-pointer">
                     <Upload className="w-8 h-8 mx-auto mb-2 text-primary" />
                     <p className="text-sm font-medium text-white">Click to select video</p>
-                    <p className="text-xs text-slate-300">or drag and drop</p>
                     <Input 
                       type="file" 
                       accept="video/*" 
@@ -294,19 +301,29 @@ export default function DashboardPage() {
                 {file && (
                   <div className="bg-white/5 rounded-lg p-3">
                     <p className="text-sm font-medium text-white">{file.name}</p>
-                    <p className="text-xs text-slate-300">
+                    <p className="text-xs text-white/80">
                       {(file.size / 1024 / 1024).toFixed(2)} MB
                     </p>
                   </div>
                 )}
 
-                <Button 
-                  onClick={handleUpload}
-                  disabled={!file || state.status === "processing"}
-                  className="w-full"
-                >
-                  {state.status === "uploading" ? "Uploading..." : "Upload & Process"}
-                </Button>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button 
+                    onClick={handleUpload}
+                    disabled={!file || state.status === "processing"}
+                    className="w-full"
+                  >
+                    {state.status === "uploading" ? "Uploading..." : "Upload & Process"}
+                  </Button>
+                  <Button
+                    onClick={handleReset}
+                    disabled={state.status === "processing"}
+                    variant="outline"
+                    className="w-full"
+                  >
+                    Reset
+                  </Button>
+                </div>
               </CardContent>
             </Card>
 
@@ -339,21 +356,15 @@ export default function DashboardPage() {
 
             {/* Controls */}
             <Card className="bg-white/10 border-white/20 backdrop-blur-sm\">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base">
-                  <GradientText
-                    colors={['#6366f1', '#8b5cf6', '#a855f7', '#8b5cf6', '#6366f1']}
-                    animationSpeed={4}
-                  >
-                    Settings
-                  </GradientText>
-                </CardTitle>
-              </CardHeader>
               <CardContent className="space-y-4">
                 {/* Text Length & Format - 2 Column Grid */}
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
-                    <label className="text-sm font-medium block text-white">Text Length</label>
+                    <GradientText
+                    colors={['#6366f1', '#8b5cf6', '#a855f7', '#8b5cf6', '#6366f1']}
+                    animationSpeed={4}
+                  >Text Length
+                  </GradientText>
                     <div className="grid grid-cols-3 gap-1.5">
                       {(["short", "medium", "long"] as TextLength[]).map(len => (
                         <Button
@@ -371,7 +382,11 @@ export default function DashboardPage() {
                   </div>
 
                   <div className="space-y-2">
-                    <label className="text-sm font-medium block text-white">Format</label>
+                    <GradientText
+                    colors={['#6366f1', '#8b5cf6', '#a855f7', '#8b5cf6', '#6366f1']}
+                    animationSpeed={4}
+                  >Format
+                  </GradientText>
                     <div className="grid grid-cols-3 gap-1.5">
                       {(["bullet", "structured", "plain"] as SummaryFormat[]).map(fmt => (
                         <Button
@@ -391,7 +406,12 @@ export default function DashboardPage() {
 
                 {/* Content Type */}
                 <div>
-                  <label className="text-sm font-medium block mb-2.5 text-white">Content Type</label>
+                  <GradientText
+                    colors={['#6366f1', '#8b5cf6', '#a855f7', '#8b5cf6', '#6366f1']}
+                    animationSpeed={4}
+                  >
+                    Content Type
+                  </GradientText>
                   <div className="grid grid-cols-2 gap-2">
                     <label className="flex items-center gap-2 cursor-pointer hover:bg-white/10 px-2 py-1.5 rounded-md transition-colors">
                       <input 
@@ -465,8 +485,8 @@ export default function DashboardPage() {
                       </CardTitle>
                     </CardHeader>
                     <CardContent className="h-[calc(100%-60px)] overflow-y-auto">
-                      <div className="bg-slate-50 rounded-lg p-4 prose prose-sm max-w-none">
-                        <pre className="whitespace-pre-wrap font-sans text-sm">
+                      <div className="bg-white/5 rounded-lg p-4 prose prose-sm max-w-none">
+                        <pre className="whitespace-pre-wrap font-sans text-sm text-white">
                           {textSummary}
                         </pre>
                       </div>
@@ -477,7 +497,7 @@ export default function DashboardPage() {
             ) : (
               <Card className="flex-1 flex items-center justify-center bg-white/10 border-white/20 backdrop-blur-sm">
                 <CardContent>
-                  <p className="text-slate-400 text-center">
+                  <p className="text-white text-center">
                     {state.status === "idle" 
                       ? "Upload a video to start" 
                       : "Processing... summary will appear here"}

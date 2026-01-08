@@ -21,15 +21,17 @@ class ModelManager:
     _instance: Optional['ModelManager'] = None
     
     def __init__(self):
-        """Private constructor - use get_instance() instead"""
-        if ModelManager._instance is not None:
-            raise RuntimeError("Use ModelManager.get_instance() instead of constructor")
+        """Idempotent initializer for singleton usage"""
+        # Allow multiple __init__ calls safely (e.g., via get_instance)
+        if getattr(self, "_initialized", False):
+            return
         
         self._gnn_model = None
         self._whisper = None
         self._text_embedder = None
         self._summarizer = None
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._initialized = True
         
         logger.info(f"ModelManager initialized (device: {self._device})")
     
@@ -37,8 +39,8 @@ class ModelManager:
     def get_instance(cls) -> 'ModelManager':
         """Get or create the singleton instance"""
         if cls._instance is None:
-            cls._instance = cls.__new__(cls)
-            cls._instance.__init__()
+            # Use normal construction path; __init__ is idempotent
+            cls._instance = cls()
         return cls._instance
     
     @classmethod
@@ -52,7 +54,7 @@ class ModelManager:
         """Get the current compute device"""
         return self._device
     
-    def get_gnn_model(self, checkpoint_path: Optional[Path] = None):
+    def get_gnn_model(self, checkpoint_path: Optional[Path] = None, in_dim: Optional[int] = None):
         """
         Get or load the GNN model.
         
@@ -66,15 +68,17 @@ class ModelManager:
             from vidsum_gnn.graph.model import VidSumGNN
             
             if checkpoint_path is None:
-                checkpoint_path = Path(settings.MODEL_DIR) / "results" / "vidsumgnn_final.pt"
+                # Prefer configured binary checkpoint; fallback to prior default
+                configured = Path(settings.GNN_CHECKPOINT)
+                checkpoint_path = configured if configured.exists() else Path(settings.MODEL_DIR) / "results" / "vidsumgnn_final.pt"
             
             logger.info(f"Loading GNN model from {checkpoint_path}")
             
             # Model configuration (should match training)
             model = VidSumGNN(
-                in_dim=1536,  # ViT (768) + HuBERT (768)
-                hidden_dim=512,
-                num_heads=4,
+                in_dim=in_dim or 1536,  # ViT (768) + HuBERT (768)
+                hidden_dim=getattr(settings, "GNN_HIDDEN_DIM", 512),
+                num_heads=getattr(settings, "GNN_NUM_HEADS", 4),
                 dropout=0.3
             )
             
@@ -140,11 +144,9 @@ class ModelManager:
         if self._summarizer is None:
             from vidsum_gnn.inference.summarization import FlanT5Summarizer
             
-            # Check for local model first
-            local_model_path = Path(settings.BASE_DIR) / "models" / "flan-t5-base"
-            if local_model_path.exists():
-                model_path = str(local_model_path)
-                logger.info(f"Using local Flan-T5 model: {model_path}")
+            # Use HuggingFace hub to avoid tokenizer version conflicts
+            model_path = "google/flan-t5-base"
+            logger.info(f"Using Flan-T5 model from HuggingFace Hub: {model_path}")
             
             self._summarizer = FlanT5Summarizer(model_path=model_path, device=self._device)
         return self._summarizer

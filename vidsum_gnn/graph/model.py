@@ -98,4 +98,22 @@ class VidSumGNN(nn.Module):
         
         # Scoring - CRITICAL: squeeze to match label shape [num_nodes]
         scores = self.scorer(h).squeeze(-1)
-        return scores
+        # Return both scores and hidden representation for downstream fusion
+        return scores, h
+# High-impact ways to raise accuracy/F1 Class balance / threshold Try threshold sweep instead of fixed 0.6 to 
+# maximize F1/accuracy on validation; log best threshold and reuse for test/inference. Slightly lower focal α (e.g., 0.65) 
+# or γ (e.g., 1.5) to reduce over-focus on hard positives if recall is low. Top-k binarization ratio Tune the positive ratio 
+# per graph (e.g., 10–20% grid) and choose the ratio yielding best val F1. Current 15% may not match label density. Learning rate 
+# schedule Add a warmup or cosine decay; alternatively, step LR down on plateau with a larger patience for scheduler 
+# (separate from early stop). Early stopping Decouple early stopping from fixed epochs: set patience to a smaller fixed number 
+# (e.g., 8–10) but allow full 40 epochs; keep best checkpoint. Regularization and capacity Increase hidden dim (e.g., 640) or 
+# heads (e.g., 6) if VRAM allows; add slight dropout on attention outputs (0.3→0.35) to reduce overfit. Edge construction Ensure 
+# multimodal edges are enabled and informative; consider k-NN tuning (KNN_K 10→15) and edge_attr normalization if not already. 
+# Sampler and class weights Revisit importance duplication: cap duplicates to avoid overfitting specific graphs; optionally add 
+# per-node class weights (pos_weight in focal/BCE) based on per-batch positive ratio. Feature scaling Verify node feature normalization 
+# (per-modality z-score) before fusion to prevent modality dominance; if absent, add a small LayerNorm after concatenation. 
+# Validation rigor Use a held-out test split (currently 0%) to avoid optimism; shuffle seeds and average over 2–3 runs to confirm gains. 
+# Concrete tweaks to try (fast loop) Sweep threshold in validation after each epoch (0.45–0.65 step 0.05) and report best F1/accuracy; 
+# pick best for checkpoint saving. Sweep binarization ratio {0.10, 0.15, 0.20} for 5–8 epochs; keep best ratio. Reduce focal γ to 1.5; 
+# if recall is already good, try γ=2.5 for precision. Increase hidden_dim to 640 and heads to 6 if VRAM is sufficient; otherwise keep 
+# 512/4. Enable LR decay: start 1e-4, ReduceLROnPlateau with factor 0.5, patience 3.

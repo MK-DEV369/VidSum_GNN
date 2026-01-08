@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     OUTPUT_DIR: str = os.path.join(os.getcwd(), "data", "outputs")
     TEMP_DIR: str = os.path.join(os.getcwd(), "data", "temp")
     MODEL_DIR: str = os.path.join(os.getcwd(), "model", "models")
+    # Primary GNN checkpoint (binary model)
+    GNN_CHECKPOINT: str = os.path.join(os.getcwd(), "model", "models", "checkpoints", "vidsum_gnn_best_binary.pt")
     # Model Defaults
     CHUNK_DURATION: int = 300  # 5 minutes
     CHUNK_OVERLAP: int = 30    # 30 seconds overlap
@@ -36,6 +38,9 @@ class Settings(BaseSettings):
     GNN_HIDDEN_DIM: int = 1024
     GNN_NUM_HEADS: int = 8
     GNN_NUM_LAYERS: int = 2
+    # Inference behavior
+    DECISION_THRESHOLD: float = 0.5
+    TOPK_RATIO: float = 0.15  # fraction of shots to select for summarization
     
     class Config:
         case_sensitive = True

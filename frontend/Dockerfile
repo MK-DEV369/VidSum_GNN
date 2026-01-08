@@ -2,14 +2,17 @@ FROM node:18-alpine
 
 WORKDIR /app
 
-# Copy package files
+# Copy package files first (for better layer caching)
 COPY package.json package-lock.json* ./
 
-# Install dependencies
-RUN npm install
+# Install dependencies with npm ci for reproducible builds
+RUN npm ci --verbose
 
 # Copy project files
 COPY . .
+
+# Verify dependencies are installed
+RUN npm list gsap motion three 2>/dev/null || echo "Warning: Some optional dependencies may not be available"
 
 EXPOSE 5173
 

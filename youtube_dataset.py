@@ -9,6 +9,8 @@ import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+ENABLE_ASR = True  # Toggle to True to run Whisper ASR; keep False to skip
+
 
 import cv2
 import librosa
@@ -55,6 +57,9 @@ class ShotFeatures:
     # Visual change
     scene_cut_strength: float
     color_hist_delta: float
+    
+    # Binary silence flag (explicit, helps model ignore noise-only shots)
+    is_silent: bool = False
 
     def to_dict(self) -> Dict[str, float]:
         return asdict(self)
@@ -67,6 +72,8 @@ class Shot:
     features: ShotFeatures
     label: Optional[float] = None  # For supervised learning (0/1 or score)
     rank: Optional[int] = None     # For reference only
+    transcription: Optional[str] = None
+    asr_confidence: Optional[float] = None
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -75,6 +82,8 @@ class Shot:
             "features": self.features.to_dict(),
             "label": self.label,
             "rank": self.rank,
+            "transcription": self.transcription,
+            "asr_confidence": self.asr_confidence,
         }
 
 
@@ -109,6 +118,9 @@ DOMAIN_WEIGHTS: Dict[str, Dict[str, float]] = {
     "movie_clip": {"motion": 0.5, "speech": 0.25, "scene_change": 0.15, "audio_energy": 0.05, "object_count": 0.05},
     "vlog": {"motion": 0.2, "speech": 0.5, "scene_change": 0.1, "audio_energy": 0.15, "object_count": 0.05},
     "default": {"motion": 0.35, "speech": 0.25, "scene_change": 0.2, "audio_energy": 0.1, "object_count": 0.1},
+    # TVSum / SumMe domains are treated like default for weighting
+    "tvsum": {"motion": 0.35, "speech": 0.25, "scene_change": 0.2, "audio_energy": 0.1, "object_count": 0.1},
+    "summe": {"motion": 0.35, "speech": 0.25, "scene_change": 0.2, "audio_energy": 0.1, "object_count": 0.1},
 }
 
 MOTION_DOWNSCALE_WIDTH = 640  # None to disable
@@ -127,6 +139,63 @@ def clear_memory() -> None:
         gc.collect()
     except Exception:
         pass
+
+
+# Optional Whisper ASR helpers (kept dormant unless ENABLE_ASR=True)
+_whisper_model_cache = None
+
+
+def _get_asr_model(model_name: str = "small"):
+    """Lazy-load Whisper model; returns None on import failure."""
+    global _whisper_model_cache
+    if _whisper_model_cache is not None:
+        return _whisper_model_cache
+    try:
+        import whisper  # type: ignore
+        _whisper_model_cache = whisper.load_model(model_name)
+    except Exception as exc:
+        print(f"⚠️  Whisper ASR unavailable: {exc}")
+        _whisper_model_cache = None
+    return _whisper_model_cache
+
+
+def transcribe_segment(audio_path: Path, start: float, end: float, model_name: str = "small") -> Tuple[str, float]:
+    """Transcribe [start, end] of an audio file. Returns (text, confidence ~ exp(logprob))."""
+    duration = max(0.0, end - start)
+    if duration <= 0:
+        return "", 0.0
+
+    model = _get_asr_model(model_name)
+    if model is None:
+        return "", 0.0
+
+    try:
+        import whisper  # type: ignore
+
+        sample_rate = whisper.audio.SAMPLE_RATE
+        audio = whisper.load_audio(str(audio_path))
+        start_idx = int(start * sample_rate)
+        end_idx = int(end * sample_rate)
+        segment = audio[start_idx:end_idx]
+        if segment.size == 0:
+            return "", 0.0
+
+        segment = whisper.pad_or_trim(segment)
+        mel = whisper.log_mel_spectrogram(segment).to(model.device)
+        options = whisper.DecodingOptions(
+            fp16=False,
+            temperature=0.0,
+            language="en",
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+        )
+        result = whisper.decode(model, mel, options)
+        text = result.text.strip() if result and hasattr(result, "text") else ""
+        conf = float(np.exp(result.avg_logprob)) if result and hasattr(result, "avg_logprob") else 0.0
+        return text, conf
+    except Exception as exc:
+        print(f"⚠️  ASR failed: {exc}")
+        return "", 0.0
 
 
 def chunked(iterable: Iterable, size: int) -> Iterable[List]:
@@ -209,6 +278,10 @@ def extract_audio(video_path: Path, output_dir: str = "model/data/raw/youtube/au
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     audio_path = Path(output_dir) / f"{video_path.stem}.wav"
+    
+    # Skip if audio already extracted
+    if audio_path.exists() and audio_path.stat().st_size > 0:
+        return audio_path
 
     cmd = [
         "ffmpeg",
@@ -227,15 +300,16 @@ def extract_audio(video_path: Path, output_dir: str = "model/data/raw/youtube/au
 
     try:
         result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-        if result.returncode == 0:
+        if result.returncode == 0 and audio_path.exists() and audio_path.stat().st_size > 0:
             return audio_path
-        
+
+        stderr_msg = (result.stderr or "").lower()
         # Check if no audio stream found
-        if "Output file does not contain any stream" in result.stderr or "no audio streams" in result.stderr.lower():
+        if "no audio stream" in stderr_msg or "no audio streams" in stderr_msg or "does not contain any stream" in stderr_msg:
             return None  # Signal that this video has no audio
-        else:
-            error_msg = result.stderr or f"FFmpeg failed with code {result.returncode}"
-            raise RuntimeError(f"Audio extraction failed: {error_msg}")
+
+        error_msg = result.stderr or f"FFmpeg failed with code {result.returncode}"
+        raise RuntimeError(f"Audio extraction failed: {error_msg}")
     except FileNotFoundError:
         raise RuntimeError("FFmpeg not found. Please install FFmpeg and add it to PATH.")
 
@@ -245,19 +319,48 @@ def extract_audio(video_path: Path, output_dir: str = "model/data/raw/youtube/au
 # ============================================================================
 
 
-def detect_shots(video_path: Path, threshold: float = 27.0) -> List[Tuple[float, float]]:
-    """Detect shot boundaries using scenedetect; fallback to single-shot."""
+def _get_video_duration(video_path: Path) -> float:
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+    cap.release()
+    fps_safe = fps if fps > 0 else 1.0
+    return float(frame_count / fps_safe) if frame_count > 0 else 0.0
+
+
+def detect_shots(video_path: Path, threshold: float = 27.0, min_duration: float = 0.75) -> List[Tuple[float, float]]:
+    """Detect shot boundaries using scenedetect with retries; fallback to single full-shot."""
+
+    shots: List[Tuple[float, float]] = []
+    thresholds = [threshold, 18.0, 12.0]
 
     try:
-        scenes = detect(str(video_path), ContentDetector(threshold=threshold))
-        return [(s[0].get_seconds(), s[1].get_seconds()) for s in scenes]
+        for thr in thresholds:
+            scenes = detect(str(video_path), ContentDetector(threshold=thr))
+            shots = [(s[0].get_seconds(), s[1].get_seconds()) for s in scenes]
+            if shots:
+                break
     except Exception as exc:
         print(f"Warning: Shot detection failed - {exc}")
-        cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
-        duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
-        cap.release()
-        return [(0.0, duration)]
+        shots = []
+
+    if not shots:
+        duration = _get_video_duration(video_path)
+        shots = [(0.0, duration)]
+
+    # Merge shots that are too short (< min_duration)
+    merged_shots = []
+    for start, end in shots:
+        duration = end - start
+        if duration >= min_duration:
+            merged_shots.append((start, end))
+        elif merged_shots:
+            prev_start, prev_end = merged_shots[-1]
+            merged_shots[-1] = (prev_start, end)
+        else:
+            merged_shots.append((start, end))
+    
+    return merged_shots
 
 
 # ============================================================================
@@ -517,7 +620,7 @@ def compute_audio_peakiness(audio_path: Path, start: float, end: float, window: 
 
 
 def extract_shot_features(video_path: Path, audio_path: Path, start: float, end: float, domain: str, shot_index: int = 0, total_shots: int = 1) -> ShotFeatures:
-    """Extract rich shot-level descriptors. No importance scoring — let GNN learn."""
+    """Extract rich shot-level descriptors. Computes is_silent flag for model robustness."""
     
     duration = end - start
     relative_position = shot_index / max(total_shots, 1)
@@ -534,6 +637,10 @@ def extract_shot_features(video_path: Path, audio_path: Path, start: float, end:
     # Visual change features
     scene_cut_strength, color_hist_delta = compute_visual_change_features(video_path, start, end)
     
+    # Explicit silence flag: helps model ignore noise-only or silent shots
+    # Threshold: >90% silence OR RMS energy below 0.01
+    is_silent = silence_ratio > 0.9 or rms_energy < 0.01
+    
     return ShotFeatures(
         duration=duration,
         relative_position=relative_position,
@@ -548,6 +655,7 @@ def extract_shot_features(video_path: Path, audio_path: Path, start: float, end:
         silence_ratio=silence_ratio,
         scene_cut_strength=scene_cut_strength,
         color_hist_delta=color_hist_delta,
+        is_silent=is_silent,
     )
 
 
@@ -556,39 +664,71 @@ def extract_shot_features(video_path: Path, audio_path: Path, start: float, end:
 # ============================================================================
 
 
-def normalize_features(shots_features: List) -> List[Dict[str, float]]:
-    """Normalize feature values to [0, 1] range per dimension."""
-    if not shots_features:
-        return []
-
-    if isinstance(shots_features[0], ShotFeatures):
-        features_list = [s.to_dict() for s in shots_features]
-    else:
-        features_list = shots_features
-
-    # Get all feature keys
-    if not features_list:
-        return []
+def normalize_features_dataset(dataset: List[VideoDataset]) -> List[VideoDataset]:
+    """
+    Normalize features across entire dataset (not per-video) to maintain cross-video consistency.
     
-    feature_keys = list(features_list[0].keys())
-    features_dict = {key: [s[key] for s in features_list] for key in feature_keys}
-
-    normalized: Dict[str, np.ndarray] = {}
-    for key, values in features_dict.items():
+    Strategy:
+      - motion_mean, motion_std, motion_peak: log(1+x) then z-score
+      - spectral_flux: log(1+x) then z-score
+      - rms_energy, rms_delta: z-score
+      - scene_cut_strength, color_hist_delta: z-score
+      - silence_ratio, relative_position: keep as-is (already bounded 0-1)
+      - is_silent: keep as-is (binary)
+    """
+    if not dataset:
+        return dataset
+    
+    # Collect all features across dataset
+    all_features = {}
+    for video in dataset:
+        for shot in video.shots:
+            feat = shot.features
+            for key in ['motion_mean', 'motion_std', 'motion_peak', 'spectral_flux', 
+                       'rms_energy', 'rms_delta', 'scene_cut_strength', 'color_hist_delta']:
+                if key not in all_features:
+                    all_features[key] = []
+                all_features[key].append(getattr(feat, key))
+    
+    # Compute statistics for z-score normalization
+    stats = {}
+    for key, values in all_features.items():
         arr = np.array(values, dtype=float)
-        min_val, max_val = arr.min(), arr.max()
-        if max_val - min_val > 1e-6:
-            normalized[key] = (arr - min_val) / (max_val - min_val)
-        else:
-            normalized[key] = np.zeros_like(arr)
-
-    result: List[Dict[str, float]] = []
-    for i in range(len(features_list)):
-        result.append({
-            key: float(normalized[key][i]) for key in feature_keys
-        })
-
-    return result
+        if key in ['motion_mean', 'motion_std', 'motion_peak', 'spectral_flux']:
+            # Log transform first (handles wide range and zeros)
+            arr = np.log1p(arr)
+        stats[key] = {'mean': float(np.mean(arr)), 'std': float(np.std(arr)) + 1e-8}
+    
+    # Apply normalization
+    for video in dataset:
+        for shot in video.shots:
+            feat = shot.features
+            # Normalize motion features
+            for key in ['motion_mean', 'motion_std', 'motion_peak']:
+                val = getattr(feat, key)
+                val_log = np.log1p(val)
+                val_norm = (val_log - stats[key]['mean']) / stats[key]['std']
+                setattr(feat, key, float(val_norm))
+            
+            # Normalize spectral flux
+            val = feat.spectral_flux
+            val_log = np.log1p(val)
+            val_norm = (val_log - stats['spectral_flux']['mean']) / stats['spectral_flux']['std']
+            feat.spectral_flux = float(val_norm)
+            
+            # Normalize RMS features
+            for key in ['rms_energy', 'rms_delta']:
+                val = getattr(feat, key)
+                val_norm = (val - stats[key]['mean']) / stats[key]['std']
+                setattr(feat, key, float(val_norm))
+            
+            # Normalize visual features
+            for key in ['scene_cut_strength', 'color_hist_delta']:
+                val = getattr(feat, key)
+                val_norm = (val - stats[key]['mean']) / stats[key]['std']
+                setattr(feat, key, float(val_norm))
+    
+    return dataset
 
 
 def compute_importance_DEPRECATED(features, weights: Optional[Dict[str, float]] = None, domain: Optional[str] = None) -> float:
@@ -629,11 +769,24 @@ def process_video(video_path: Path, audio_path: Path, domain: str = "default", s
         if (i + 1) % SHOT_GC_INTERVAL == 0:
             clear_memory()
 
-    # Create shots WITHOUT importance scores
-    shots = [
-        Shot(start=start, end=end, features=feat, label=None)
-        for (start, end), feat in zip(shot_boundaries, shots_features)
-    ]
+    shots: List[Shot] = []
+    for (start, end), feat in zip(shot_boundaries, shots_features):
+        transcription = None
+        asr_confidence = None
+        if ENABLE_ASR and audio_path is not None:
+            # Flip ENABLE_ASR to True to run per-shot Whisper transcription.
+            transcription, asr_confidence = transcribe_segment(audio_path, start, end)
+
+        shots.append(
+            Shot(
+                start=start,
+                end=end,
+                features=feat,
+                label=None,
+                transcription=transcription,
+                asr_confidence=asr_confidence,
+            )
+        )
 
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
@@ -694,6 +847,11 @@ def build_dataset(
         print(f"⚠️  Video root not found: {video_root}")
         return dataset
 
+    # Load already-processed video IDs to skip them
+    processed_ids = get_processed_video_ids("unified")
+    if processed_ids:
+        print(f"✓ Found {len(processed_ids)} already-processed videos, will skip them")
+
     playlist_dirs = [p for p in video_root.iterdir() if p.is_dir()]
     if playlist_filter:
         playlist_dirs = [p for p in playlist_dirs if p.name in playlist_filter]
@@ -710,6 +868,12 @@ def build_dataset(
             print(f"⚠️  No videos found in {playlist_dir}")
             continue
 
+        # Filter out already-processed videos
+        video_paths = [v for v in video_paths if v.stem not in processed_ids]
+        if not video_paths:
+            print(f"⏭️  All videos in {playlist_name} already processed")
+            continue
+
         print(f"\n{'='*60}")
         print(f"Playlist: {playlist_name} ({domain})")
         print(f"Found {len(video_paths)} videos (processing up to {len(video_paths)})")
@@ -717,21 +881,25 @@ def build_dataset(
         for batch in chunked(video_paths, batch_size):
             for video_path in batch:
                 # Skip if already processed
-                feature_file = UNIFIED_OUTPUT_DIR / "youtube" / "features" / f"{video_path.stem}_features.json"
-                if feature_file.exists():
-                    print(f"   Skipping {video_path.name} (already processed)")
+                if video_path.stem in processed_ids:
+                    print(f"  ⏭️  {video_path.stem} already processed")
                     continue
 
-                print(f"\nProcessing: {video_path.name}")
+                print(f"  Processing {video_path.stem}...")
                 try:
                     audio_path = extract_audio(video_path)
+                    if not audio_path:
+                        print(f"    ✗ No audio found for {video_path.stem}")
+                        continue
+                    
                     video_data = process_video(video_path, audio_path, domain=domain)
                     dataset.append(video_data)
-                    print(f"✓ Completed: {len(video_data.shots)} shots")
+                    print(f"    ✓ Extracted {len(video_data.shots)} shots")
                     if save_frequency == "video":
                         save_unified_dataset_incremental(dataset)
                 except Exception as exc:
-                    print(f"✗ Error processing {video_path.name}: {exc}")
+                    print(f"    ✗ Error processing {video_path.stem}: {exc}")
+                    continue
                 finally:
                     clear_memory()
             clear_memory()
@@ -742,6 +910,12 @@ def build_dataset(
     # Apply pseudo-labels to YouTube videos before saving
     if dataset:
         dataset = apply_pseudo_labels_youtube(dataset, top_k_ratio=0.15)
+    
+    # Normalize features across dataset (fixes scale imbalance issue)
+    if dataset:
+        print("\n📊 Normalizing features across dataset...")
+        dataset = normalize_features_dataset(dataset)
+        print("✓ Feature normalization complete (log+zscore applied)")
 
     if output_path:
         output_path = Path(output_path)
@@ -870,79 +1044,124 @@ def load_tvsumme_dataset(json_file: Path, video_path: Optional[Path] = None, aud
     return [dataset]
 
 
-def load_all_tvsumme(dataset_name: str = "tvsum") -> List[VideoDataset]:
-    """Load all TVSum or SumMe videos from raw directory with unified feature extraction."""
-    raw_dir = RAW_TVSUMME_DIR if dataset_name == "tvsum" else RAW_SUMME_DIR
+def preprocess_tvsumme_videos(dataset_name: str = "tvsum") -> None:
+    """Preprocess TVSum/SumMe videos into JSON files with features."""
     
-    # Hard-coded video directories
+    # Set directories
     if dataset_name == "tvsum":
         video_dir = Path("model/data/raw/tvsum/video")
+        output_dir = RAW_TVSUMME_DIR
     else:  # summe
         video_dir = Path("model/data/raw/summe/videos")
+        output_dir = RAW_SUMME_DIR
+    
+    if not video_dir.exists():
+        print(f"⚠️  Video directory not found: {video_dir}")
+        return
+    
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get all video files
+    video_files = list(video_dir.glob("*.mp4"))
+    if not video_files:
+        print(f"⚠️  No MP4 files found in {video_dir}")
+        return
+    
+    print(f"\n🎬 Preprocessing {len(video_files)} {dataset_name.upper()} videos...")
+    
+    for video_path in video_files:
+        video_id = video_path.stem
+        json_file = output_dir / f"{video_id}.json"
+        
+        # Skip if already processed
+        if json_file.exists():
+            print(f"   ⏭️  {video_id} (already processed)")
+            continue
+        
+        print(f"\n   Processing {video_id}...")
+        
+        try:
+            # Extract audio
+            audio_path = extract_audio(video_path, output_dir=str(output_dir / "audio"))
+            if not audio_path:
+                print(f"      ⚠️  No audio stream found")
+                continue
+            
+            # Process video to extract features
+            video_data = process_video(video_path, audio_path, domain=dataset_name, smooth_sigma=2.0)
+            
+            # Apply pseudo-labels (top-15% by duration)
+            num_shots = len(video_data.shots)
+            top_k = max(1, int(np.ceil(num_shots * 0.15)))
+            durations = [s.end - s.start for s in video_data.shots]
+            top_k_indices = np.argsort(durations)[-top_k:].tolist()
+            
+            for i, shot in enumerate(video_data.shots):
+                shot.label = 1.0 if i in top_k_indices else 0.0
+            
+            # Save as JSON
+            with open(json_file, "w") as f:
+                json.dump(video_data.to_dict(), f, indent=2)
+            
+            print(f"      ✓ Saved {len(video_data.shots)} shots")
+            clear_memory()
+            
+        except Exception as e:
+            print(f"      ✗ Error: {e}")
+            clear_memory()
+
+
+def load_all_tvsumme(dataset_name: str = "tvsum") -> List[VideoDataset]:
+    """Load all TVSum or SumMe videos from preprocessed JSON files."""
+    raw_dir = RAW_TVSUMME_DIR if dataset_name == "tvsum" else RAW_SUMME_DIR
+    
+    # First, preprocess if needed
+    preprocess_tvsumme_videos(dataset_name)
     
     if not raw_dir.exists():
         print(f"⚠️  {dataset_name.upper()} directory not found: {raw_dir}")
         return []
 
     all_videos = []
-    json_files = list(raw_dir.glob("*.json"))
+    json_files = sorted(raw_dir.glob("*.json"))
     
     if not json_files:
-        print(f"⚠️  No JSON files found in {raw_dir}")
+        print(f"⚠️  No JSON files found in {raw_dir} after preprocessing")
         return []
 
-    print(f"\nLoading {len(json_files)} {dataset_name.upper()} videos with feature extraction...")
-    print(f"   Video directory: {video_dir}")
+    print(f"\nLoading {len(json_files)} {dataset_name.upper()} videos from preprocessed JSON...")
     
-    audio_dir = Path("model/data/raw") / dataset_name / "audio"
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    
-    for json_file in sorted(json_files):
+    for json_file in json_files:
         video_id = json_file.stem
-        print(f"\n  Processing {video_id}...")
         
         try:
-            # Try to find video file in the specified video directory
-            video_path = None
-            for ext in ["*.mp4", "*.avi", "*.mkv", "*.mov"]:
-                matches = list(video_dir.glob(ext))
-                for match in matches:
-                    if match.stem == video_id:
-                        video_path = match
-                        break
-                if video_path:
-                    break
+            with open(json_file) as f:
+                video_dict = json.load(f)
             
-            # Extract audio if video found
-            audio_path = None
-            if video_path:
-                print(f"    Found video: {video_path.name}")
-                try:
-                    audio_path = extract_audio(video_path, output_dir=str(audio_dir))
-                    if audio_path:
-                        print(f"    Extracted audio: {audio_path.name}")
-                    else:
-                        print(f"    Warning: No audio stream in video")
-                except Exception as e:
-                    print(f"    Warning: Audio extraction failed - {e}")
-            else:
-                print(f"    Warning: No video file found for {video_id}")
+            # Reconstruct VideoDataset from JSON
+            shots = [
+                Shot(
+                    start=s["start"],
+                    end=s["end"],
+                    features=ShotFeatures(**s["features"]),
+                    label=s.get("label"),
+                    rank=s.get("rank")
+                )
+                for s in video_dict.get("shots", [])
+            ]
             
-            # Load dataset with video/audio paths (if available)
-            videos = load_tvsumme_dataset(
-                json_file, 
-                video_path=video_path,
-                audio_path=audio_path,
-                domain=dataset_name
+            video = VideoDataset(
+                video_id=video_dict["video_id"],
+                duration=video_dict["duration"],
+                domain=dataset_name,
+                shots=shots
             )
-            if videos:
-                all_videos.extend(videos)
-                print(f"    ✓ Loaded {len(videos[0].shots)} shots")
+            all_videos.append(video)
+            print(f"   ✓ {video_id}: {len(shots)} shots, {video.duration:.1f}s")
             
         except Exception as e:
-            print(f"  ✗ Error loading {video_id}: {e}")
+            print(f"   ✗ Error loading {video_id}: {e}")
         
-        # Cleanup memory
         clear_memory()
 
     return all_videos
@@ -1521,7 +1740,7 @@ def test_dataset(dataset: List[VideoDataset]) -> bool:
         print("✗ Test 4: Some shots have invalid temporal boundaries")
 
     tests_total += 1
-    valid_domains = {"lecture", "interview", "sports", "documentary", "gaming", "music", "movie_trailer", "movie_clip", "default"}
+    valid_domains = {"lecture", "interview", "sports", "documentary", "gaming", "music", "movie_trailer", "movie_clip", "default", "tvsum", "summe"}
     all_domains_valid = all(v.domain in valid_domains for v in dataset)
     if all_domains_valid:
         print("✓ Test 5: All videos have valid domain labels")
