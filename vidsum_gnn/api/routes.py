@@ -297,7 +297,7 @@ async def get_results(video_id: str, db: AsyncSession = Depends(get_db)) -> Summ
         },
         summary_type=summary_type,
         fallback_used=fallback_used,
-        generated_at=summary.created_at.isoformat() if summary.created_at else None
+        generated_at=summary.generated_at.isoformat() if summary.generated_at else None
     )
 
 @router.get("/summary/{video_id}/text")
@@ -333,12 +333,25 @@ async def get_text_summary(
         "plain": summary.text_summary_plain
     }
     
+    # Get requested format, fallback to any available format if not found
+    requested_summary = summary_map.get(format)
+    if not requested_summary:
+        # Try to find any non-empty summary
+        for fmt, text in summary_map.items():
+            if text:
+                requested_summary = text
+                format = fmt  # Update format to reflect what we're actually returning
+                break
+    
+    if not requested_summary:
+        raise HTTPException(status_code=404, detail="No text summary available")
+    
     return TextSummaryResponse(
         video_id=video_id,
-        summary=summary_map.get(format, ""),
+        summary=requested_summary,
         format=format,
         style=summary.summary_style,
-        generated_at=summary.created_at.isoformat() if summary.created_at else None
+        generated_at=summary.generated_at.isoformat() if summary.generated_at else None
     )
 
 @router.get("/shot-scores/{video_id}")
@@ -402,21 +415,27 @@ async def list_videos(
     }
 
 @router.get("/download/{video_id}")
-async def download_summary_video(video_id: str, db: AsyncSession = Depends(get_db)):
-    """Download the generated summary video (if generated)"""
+async def download_merged_video(video_id: str, db: AsyncSession = Depends(get_db)):
+    """Download the merged video compilation of important shots"""
     result = await db.execute(
         select(Summary).where(Summary.video_id == video_id)
     )
     summary = result.scalar_one_or_none()
     
     if not summary or not summary.video_path:
+        logger.error(f"No summary or video_path for {video_id}")
         raise HTTPException(status_code=404, detail="Summary video not found")
     
     from pathlib import Path
     video_path = Path(summary.video_path)
+    
+    logger.info(f"[Download] Video ID: {video_id}, Path: {summary.video_path}, Exists: {video_path.exists()}")
+    
     if not video_path.exists():
+        logger.error(f"Video file does not exist: {video_path}")
         raise HTTPException(status_code=404, detail="Summary video file not found")
     
+    logger.info(f"[Download] Serving video: {video_path}")
     return FileResponse(
         path=str(video_path),
         media_type="video/mp4",

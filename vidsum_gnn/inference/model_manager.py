@@ -74,22 +74,69 @@ class ModelManager:
             
             logger.info(f"Loading GNN model from {checkpoint_path}")
             
-            # Model configuration (should match training)
+            # Load checkpoint to infer correct dimensions FIRST before creating model
+            checkpoint_data = None
+            in_dim_inferred = None
+            hidden_dim = None
+            num_heads = None
+            
+            if checkpoint_path.exists():
+                try:
+                    checkpoint_data = torch.load(checkpoint_path, map_location=self._device)
+                    # Extract model config from checkpoint if available
+                    if 'config' in checkpoint_data:
+                        config = checkpoint_data['config']
+                        in_dim_inferred = config.get('in_dim', None)
+                        hidden_dim = config.get('hidden_dim', None)
+                        num_heads = config.get('num_heads', None)
+                        logger.info(f"Using checkpoint config: in_dim={in_dim_inferred}, hidden_dim={hidden_dim}, num_heads={num_heads}")
+                    
+                    # Always infer from state dict for safety (overrides config if present)
+                    state_dict = checkpoint_data.get('model_state_dict', checkpoint_data)
+                    
+                    # Infer in_dim from input_proj.weight (most reliable)
+                    if 'input_proj.weight' in state_dict:
+                        in_dim_inferred = state_dict['input_proj.weight'].shape[1]
+                        logger.info(f"Inferred in_dim={in_dim_inferred} from checkpoint")
+                    
+                    # Infer hidden_dim from gat1.lin_l.weight
+                    if 'gat1.lin_l.weight' in state_dict:
+                        hidden_dim = state_dict['gat1.lin_l.weight'].shape[0]
+                        logger.info(f"Inferred hidden_dim={hidden_dim} from checkpoint")
+                    
+                    # Infer num_heads from gat1.att
+                    if 'gat1.att' in state_dict:
+                        num_heads = state_dict['gat1.att'].shape[1]
+                        logger.info(f"Inferred num_heads={num_heads} from checkpoint")
+                    
+                except Exception as e:
+                    logger.warning(f"Could not extract config from checkpoint: {e}. Using defaults.")
+            
+            # Use inferred values or fallback to defaults
+            in_dim_final = in_dim_inferred if in_dim_inferred is not None else (in_dim or 1536)
+            hidden_dim_final = hidden_dim if hidden_dim is not None else getattr(settings, "GNN_HIDDEN_DIM", 512)
+            num_heads_final = num_heads if num_heads is not None else getattr(settings, "GNN_NUM_HEADS", 4)
+            
+            logger.info(f"Creating GNN model with: in_dim={in_dim_final}, hidden_dim={hidden_dim_final}, num_heads={num_heads_final}")
+            
+            # Create model with inferred dimensions (MUST match checkpoint)
             model = VidSumGNN(
-                in_dim=in_dim or 1536,  # ViT (768) + HuBERT (768)
-                hidden_dim=getattr(settings, "GNN_HIDDEN_DIM", 512),
-                num_heads=getattr(settings, "GNN_NUM_HEADS", 4),
+                in_dim=in_dim_final,
+                hidden_dim=hidden_dim_final,
+                num_heads=num_heads_final,
                 dropout=0.3
             )
             
-            # Load checkpoint if exists
-            if checkpoint_path.exists():
+            # Load checkpoint weights
+            if checkpoint_data is not None:
                 try:
-                    checkpoint = torch.load(checkpoint_path, map_location=self._device)
-                    model.load_state_dict(checkpoint['model_state_dict'])
-                    logger.info(f"✓ Loaded GNN weights from checkpoint")
+                    state_dict = checkpoint_data.get('model_state_dict', checkpoint_data)
+                    model.load_state_dict(state_dict)
+                    logger.info(f"✓ Loaded GNN weights from checkpoint (in_dim={in_dim_final}, hidden_dim={hidden_dim_final}, num_heads={num_heads_final})")
                 except Exception as e:
                     logger.warning(f"Failed to load checkpoint: {e}. Using untrained model.")
+            elif checkpoint_path.exists():
+                logger.warning(f"Checkpoint not loaded properly at {checkpoint_path}. Using untrained model.")
             else:
                 logger.warning(f"Checkpoint not found at {checkpoint_path}. Using untrained model.")
             

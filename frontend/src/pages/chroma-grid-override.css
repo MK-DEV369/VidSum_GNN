@@ -1,0 +1,10 @@
+/* Ensure ChromaGrid images are square, zoomed, and rounded */
+.chroma-grid-img {
+  width: 200px !important;
+  height: 200px !important;
+  object-fit: cover !important;
+  object-position: center !important;
+  border-radius: 16px !important;
+  background: #222;
+  overflow: hidden;
+}

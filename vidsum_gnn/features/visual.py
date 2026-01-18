@@ -1,4 +1,5 @@
 import torch
+import gc
 from transformers import ViTImageProcessor, ViTModel
 from PIL import Image
 from typing import List
@@ -27,28 +28,39 @@ class VisualEncoder:
         Returns:
             Tensor of shape (batch_size, 768) with normalized embeddings
         """
-        images = []
-        valid_paths = []
+        embeddings = []
+        batch_size = 4  # Process 4 images at a time
         
-        for p in image_paths:
-            try:
-                img = Image.open(p).convert("RGB")
-                images.append(img)
-                valid_paths.append(p)
-            except Exception as e:
-                print(f"Error loading image {p}: {e}")
-                # Use black placeholder
-                images.append(Image.new("RGB", (224, 224)))
-                valid_paths.append(p)
-        
-        if not images:
-            return torch.empty(0, 768, device='cpu')
-
-        inputs = self.processor(images=images, return_tensors="pt").to(self.device)
-        
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-            # ViT pooler_output = [CLS] token representation (768-dim)
-            embeddings = outputs.pooler_output  # (batch_size, 768)
+        for batch_idx in range(0, len(image_paths), batch_size):
+            batch_end = min(batch_idx + batch_size, len(image_paths))
+            batch_paths = image_paths[batch_idx:batch_end]
             
-        return embeddings.cpu()
+            images = []
+            for p in batch_paths:
+                try:
+                    img = Image.open(p).convert("RGB")
+                    images.append(img)
+                except Exception as e:
+                    print(f"Error loading image {p}: {e}")
+                    images.append(Image.new("RGB", (224, 224)))
+            
+            if not images:
+                continue
+
+            inputs = self.processor(images=images, return_tensors="pt").to(self.device)
+            
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                batch_embeddings = outputs.pooler_output
+                embeddings.append(batch_embeddings.cpu())
+            
+            # Cleanup
+            del inputs, outputs, images
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+        
+        if not embeddings:
+            return torch.empty(0, 768)
+            
+        return torch.cat(embeddings, dim=0)

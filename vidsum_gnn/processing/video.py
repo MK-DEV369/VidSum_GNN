@@ -192,3 +192,188 @@ def get_chunks(duration: float, chunk_size: int = 300, overlap: int = 30) -> Lis
     
     logger.info(f"Generated {len(chunks)} chunks for {duration:.1f}s video (chunk_size={chunk_size}s, overlap={overlap}s)")
     return chunks
+
+async def merge_important_shots(
+    input_video: str,
+    shots_times: List[Tuple[float, float]],
+    importance_scores: List[float],
+    threshold: float = 0.5,
+    output_path: str = None,
+    max_duration: int = 600
+) -> str:
+    """
+    Create a merged video containing only the important shots.
+    
+    Args:
+        input_video: Path to the original video
+        shots_times: List of (start_sec, end_sec) tuples for all shots
+        importance_scores: GNN importance scores for each shot (0-1)
+        threshold: Importance threshold (default 0.5) - shots with score >= threshold are included
+        output_path: Where to save the merged video (auto-generated if None)
+        max_duration: Maximum duration for the merged video in seconds
+        
+    Returns:
+        Path to the merged video file
+    """
+    logger = get_logger(__name__)
+    logger.info(f"Merging important shots (threshold={threshold})")
+    
+    # Filter shots by importance
+    important_shots = [
+        (shots_times[i], importance_scores[i])
+        for i in range(len(shots_times))
+        if i < len(importance_scores) and importance_scores[i] >= threshold
+    ]
+    
+    if not important_shots:
+        # If no shots meet threshold, use top 20% of shots (min 10, max 50)
+        num_fallback = max(10, min(50, len(shots_times) // 5))
+        logger.warning(f"No shots met threshold {threshold}, using top {num_fallback} shots")
+        sorted_shots = sorted(
+            zip(shots_times, importance_scores),
+            key=lambda x: x[1],
+            reverse=True
+        )
+        important_shots = sorted_shots[:num_fallback]
+    
+    logger.info(f"Selected {len(important_shots)} important shots out of {len(shots_times)}")
+    
+    if output_path is None:
+        video_id = os.path.basename(input_video).split('_')[0]
+        output_path = os.path.join(settings.TEMP_DIR, f"{video_id}_important_shots.mp4")
+    
+    # Create concat demux file for ffmpeg
+    concat_file = output_path.replace('.mp4', '_concat.txt')
+    
+    try:
+        # Calculate total duration of important shots
+        total_duration = sum(end - start for (start, end), _ in important_shots)
+        
+        # If total duration exceeds max, sample shots to reduce it
+        if total_duration > max_duration:
+            logger.info(f"Important shots total {total_duration:.1f}s exceeds max {max_duration}s, sampling...")
+            # Keep only top shots until we reach max_duration
+            sampled_shots = []
+            current_duration = 0
+            for shot, score in sorted(important_shots, key=lambda x: x[1], reverse=True):
+                shot_duration = shot[1] - shot[0]
+                if current_duration + shot_duration <= max_duration:
+                    sampled_shots.append((shot, score))
+                    current_duration += shot_duration
+            
+            important_shots = sorted(sampled_shots, key=lambda x: x[0][0])  # Re-sort by time
+            total_duration = current_duration
+        
+        logger.info(f"Creating merged video with {len(important_shots)} shots ({total_duration:.1f}s total)")
+        
+        # Extract individual segments with video+audio
+        segments = []
+        for i, ((start, end), score) in enumerate(important_shots):
+            segment_path = output_path.replace('.mp4', f'_seg_{i:03d}.mp4')
+            
+            seg_cmd = [
+                "ffmpeg",
+                "-i", input_video,
+                "-ss", str(start),
+                "-to", str(end),
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-y",
+                segment_path
+            ]
+            
+            logger.debug(f"Extracting segment {i+1}/{len(important_shots)}: {start:.1f}s-{end:.1f}s")
+            
+            process = await asyncio.create_subprocess_exec(
+                *seg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+            
+            if process.returncode == 0:
+                segments.append(segment_path)
+                logger.debug(f"✓ Extracted segment {i+1}")
+            else:
+                logger.error(f"Failed to extract segment {i}: {stderr.decode()[:200]}")
+        
+        if not segments:
+            logger.error("No segments extracted successfully")
+            raise RuntimeError("Failed to extract any video segments")
+        
+        # Concatenate all segments
+        if len(segments) == 1:
+            # Single segment, just rename it
+            import shutil
+            shutil.move(segments[0], output_path)
+            logger.info(f"✓ Single segment, moved to {output_path}")
+        else:
+            # Multiple segments, use concat demuxer
+            concat_file_path = output_path.replace('.mp4', '_concat.txt')
+            with open(concat_file_path, 'w') as f:
+                for seg in segments:
+                    f.write(f"file '{seg}'\n")
+            
+            logger.debug(f"Concatenating {len(segments)} segments")
+            
+            concat_cmd = [
+                "ffmpeg",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", concat_file_path,
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-y",
+                output_path
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *concat_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=600)
+            
+            if process.returncode != 0:
+                logger.error(f"FFmpeg concat failed: {stderr.decode()[:300]}")
+                raise RuntimeError(f"Failed to concatenate segments: {stderr.decode()[:300]}")
+            
+            logger.debug(f"✓ Concatenated {len(segments)} segments")
+            
+            # Cleanup segment files
+            for seg in segments:
+                try:
+                    os.remove(seg)
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup segment {seg}: {e}")
+            
+            try:
+                os.remove(concat_file_path)
+            except Exception:
+                pass
+        
+        if os.path.exists(output_path):
+            file_size = os.path.getsize(output_path) / (1024*1024)
+            logger.info(f"✓ Merged video created: {output_path} ({file_size:.1f}MB)")
+            return output_path
+        else:
+            raise RuntimeError(f"Output file not created: {output_path}")
+        
+    except Exception as e:
+        logger.error(f"Error in merge_important_shots: {str(e)[:200]}")
+        if os.path.exists(concat_file):
+            try:
+                os.remove(concat_file)
+            except:
+                pass
+        raise

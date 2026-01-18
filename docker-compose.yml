@@ -8,8 +8,12 @@ services:
     volumes:
       - .:/app
       - ./data:/app/data
+      - huggingface_cache:/root/.cache/huggingface
+      - torch_cache:/root/.cache/torch
     environment:
       - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/vidsum
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      - HF_HOME=/root/.cache/huggingface
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=password
       - POSTGRES_DB=vidsum
@@ -99,6 +103,8 @@ volumes:
   postgres_data:
   redis_data:
   frontend_node_modules:
+  huggingface_cache:
+  torch_cache:
 
     # version: "3.8"
 

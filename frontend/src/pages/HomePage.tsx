@@ -1,4 +1,6 @@
 import { Link } from "react-router-dom";
+import Mahantesh from "../lib/Mahantesh.jpeg";
+import Morya from "../lib/Morya.jpg";
 import { 
   Upload, 
   Video, 
@@ -15,6 +17,7 @@ import FloatingLines from "../components/FloatingLines";
 import SpotlightCard from "../components/SpotlightCard";
 import GradientText from "../components/GradientText";
 import ChromaGrid from "../components/ChromaGrid";
+import "./chroma-grid-override.css";
 
 export default function HomePage() {
   const features = [
@@ -36,7 +39,7 @@ export default function HomePage() {
     {
       icon: <Scissors className="w-10 h-10 text-white" />,
       title: "Smart Summary Generation",
-      description: "Flexible algorithms (greedy, knapsack) generate summaries with customizable length, format (bullet/structured/plain), and content priority."
+      description: "Flexible Content Types (Balanced/Visual/Audio/Highlights) for generating summaries with customizable length, format (bullet/structured/plain), and content priority."
     }
   ];
 
@@ -57,6 +60,18 @@ export default function HomePage() {
   ];
 
   return (
+  <>
+      <style>{`
+        .chroma-grid-team img {
+          width: 300px !important;
+          height: 300px !important;
+          object-fit: cover !important;
+          object-position: center !important;
+          border-radius: 16px !important;
+          background: #222;
+          overflow: hidden;
+        }
+      `}</style>
     <div className="min-h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950" style={{ position: 'relative' }}>
       {/* Animated Background */}
       <div style={{ position: 'fixed', inset: 0, zIndex: 0 }}>
@@ -101,7 +116,7 @@ export default function HomePage() {
           </p>
           <div className="flex gap-4 justify-center">
             <Link to="/dashboard">
-              <Button size="lg" className="gap-2">
+              <Button size="lg" className="gap-2 bg-gradient-to-r from-violet-600 via-pink-500 to-blue-600 hover:from-violet-700 hover:via-pink-600 hover:to-blue-700 text-white font-semibold transition-all">
                 Try Dashboard <ArrowRight className="w-4 h-4" />
               </Button>
             </Link>
@@ -222,10 +237,11 @@ export default function HomePage() {
           </CardHeader>
           <CardContent>
             <div style={{ minHeight: '400px', position: 'relative' }}>
+              <div className="chroma-grid-team">
               <ChromaGrid
                 items={[
                   {
-                    image: 'https://i.pravatar.cc/300?img=33',
+                    image: Morya,
                     title: 'L Moryakantha',
                     subtitle: 'Backend & GNN Architecture',
                     handle: '1RV24AI406',
@@ -233,7 +249,7 @@ export default function HomePage() {
                     gradient: 'linear-gradient(145deg, #4F46E5, #000)'
                   },
                   {
-                    image: 'https://i.pravatar.cc/300?img=12',
+                    image: Mahantesh,
                     title: 'Mahantesh PB',
                     subtitle: 'Frontend & UI Development',
                     handle: '1RV24AI407',
@@ -247,11 +263,14 @@ export default function HomePage() {
                 damping={0.5}
                 fadeOut={0.7}
               />
+              </div>
             </div>
+            
           </CardContent>
         </Card>
       </div>
       </div>
     </div>
-  );
+    </>
+  );  
 }

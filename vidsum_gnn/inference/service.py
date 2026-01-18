@@ -128,14 +128,25 @@ class InferenceService:
             if audio_path_obj.exists():
                 try:
                     transcript = transcriber.transcribe(audio_path_obj, cache_dir)
-                    transcripts.append(transcript)
+                    # Filter out empty or garbage transcriptions
+                    if transcript and len(transcript.strip()) > 3:
+                        transcripts.append(transcript.strip())
+                    else:
+                        transcripts.append("")
                 except Exception as e:
                     logger.error(f"Transcription failed for {audio_path_obj}: {e}")
                     transcripts.append("")
             else:
                 transcripts.append("")
         
-        logger.info(f"Transcription complete ({sum(1 for t in transcripts if t)} successful)")
+        valid_transcripts = sum(1 for t in transcripts if t)
+        logger.info(f"Transcription complete ({valid_transcripts}/{len(transcripts)} valid)")
+        
+        # If too few valid transcriptions, warn user
+        if valid_transcripts == 0:
+            logger.warning("No valid transcriptions found - video may contain only music/noise")
+            return "⚠️ No speech detected in video - unable to generate summary"
+        
         # Optional: compute fused features for downstream use/logging
         _fused = self.fuse_hidden_with_text(transcripts)
         

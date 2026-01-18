@@ -1,5 +1,6 @@
 import torch
 import torchaudio
+import gc
 from transformers import HubertModel, Wav2Vec2FeatureExtractor
 from typing import List
 import numpy as np
@@ -62,14 +63,20 @@ class AudioEncoder:
                     # Mean pool over temporal dimension
                     hidden_states = outputs.last_hidden_state
                     pooled = torch.mean(hidden_states, dim=1)  # (batch, 768)
-                    embeddings.append(pooled)
+                    embeddings.append(pooled.cpu())  # Move to CPU immediately
+                    
+                # Cleanup
+                del waveform, inputs, outputs, hidden_states, pooled
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
                     
             except Exception as e:
                 print(f"Error processing audio {p}: {e}")
                 # Return zero vector on error
-                embeddings.append(torch.zeros(1, 768, device=self.device))
+                embeddings.append(torch.zeros(1, 768))
         
         if not embeddings:
-            return torch.empty(0, 768, device='cpu')
+            return torch.empty(0, 768)
             
-        return torch.cat(embeddings, dim=0).cpu()
+        return torch.cat(embeddings, dim=0)

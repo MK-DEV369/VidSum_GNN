@@ -10,12 +10,46 @@ SUPPORTS:
 import torch
 import numpy as np
 import re
+import time
 from typing import List, Optional, Dict, Tuple
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from requests.exceptions import ConnectionError, ChunkedEncodingError
+from urllib3.exceptions import IncompleteRead
 
 from vidsum_gnn.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def retry_with_backoff(func, max_retries=3, initial_delay=2):
+    """
+    Retry a function with exponential backoff on network errors.
+    
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds (doubles each retry)
+    
+    Returns:
+        Function result if successful
+        
+    Raises:
+        Last exception if all retries fail
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except (ConnectionError, ChunkedEncodingError, IncompleteRead, OSError) as e:
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} retry attempts failed")
+                raise
+            
+            delay = initial_delay * (2 ** attempt)
+            logger.warning(f"Network error (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}...")
+            logger.info(f"Retrying in {delay} seconds...")
+            time.sleep(delay)
+    
+    raise RuntimeError("Retry logic failed unexpectedly")
 
 
 class FlanT5Summarizer:
@@ -46,8 +80,23 @@ class FlanT5Summarizer:
         self.max_input_chars = 2000
         
         logger.info(f"Loading Flan-T5 summarizer: {model_path}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_path).to(self.device)
+        
+        # Load with retry logic for network interruptions
+        self.tokenizer = retry_with_backoff(
+            lambda: AutoTokenizer.from_pretrained(
+                model_path,
+                resume_download=True,
+                force_download=False
+            )
+        )
+        
+        self.model = retry_with_backoff(
+            lambda: AutoModelForSeq2SeqLM.from_pretrained(
+                model_path,
+                resume_download=True,
+                force_download=False
+            ).to(self.device)
+        )
         self.model.eval()
         
         logger.info(f"✓ Flan-T5 loaded on {self.device}")
@@ -85,6 +134,12 @@ class FlanT5Summarizer:
         Returns:
             Formatted summary string
         """
+        # Log input parameters for verification
+        logger.info(f"\n=== SUMMARIZER CALLED ===")
+        logger.info(f"Parameters: type={summary_type}, length={text_length}, format={summary_format}")
+        logger.info(f"Transcripts: {len(transcripts)} shots, GNN scores: {len(gnn_scores)} scores")
+        logger.info(f"Top-K: {top_k}")
+        logger.info(f"=== END PARAMS ===")
         # Validate inputs
         if not transcripts or all(not t.strip() for t in transcripts):
             logger.warning("No valid transcripts provided, returning fallback")
@@ -98,12 +153,14 @@ class FlanT5Summarizer:
             gnn_scores = gnn_scores[:min_len]
         
         # Length parameters (in tokens, not words)
+        # Raised to encourage minimum line counts per length bucket.
         length_map = {
-            "short": (30, 70),
-            "medium": (70, 150),
-            "long": (150, 300)
+            "short": (90, 180),
+            "medium": (180, 280),
+            "long": (280, 480)
         }
-        min_length, max_length = length_map.get(text_length, (70, 150))
+        min_length, max_length = length_map.get(text_length, (180, 280))
+        logger.info(f"✓ Length '{text_length}' → min_tokens={min_length}, max_tokens={max_length}")
         
         # Select top-K shots based on GNN importance scores
         scores_arr = np.array(gnn_scores, dtype=np.float32)
@@ -150,6 +207,7 @@ class FlanT5Summarizer:
         )
         
         # Format output according to requested format
+        logger.info(f"✓ Raw summary: {len(summary_text)} chars, now formatting as '{summary_format}'...")
         formatted = self._format_summary(
             summary_text,
             summary_format,
@@ -157,7 +215,7 @@ class FlanT5Summarizer:
             text_length
         )
         
-        logger.info(f"Generated {summary_type} {text_length} {summary_format} summary ({len(formatted)} chars)")
+        logger.info(f"✓ FINAL: {summary_type} {text_length} {summary_format} summary ({len(formatted)} chars)")
         return formatted
     
     def _get_context_prompt(self, summary_type: str) -> str:
@@ -186,7 +244,9 @@ class FlanT5Summarizer:
                 "Be concise and focus on what's most impactful."
             )
         }
-        return prompts.get(summary_type, prompts["balanced"])
+        selected_prompt = prompts.get(summary_type, prompts["balanced"])
+        logger.info(f"✓ Type '{summary_type}' → context prompt selected")
+        return selected_prompt
     
     def _generate_summary(
         self,
@@ -209,11 +269,14 @@ class FlanT5Summarizer:
         Returns:
             Generated summary text
         """
-        # Build comprehensive prompt
+        # Build aggressive prompt to force condensing and key point extraction
+        # Use explicit instruction to avoid repeating the full text
         prompt = (
+            f"Extract key points from this video transcript. Be concise and focus on main ideas. "
+            f"Output only bullet points, each under 20 words. Do not repeat the entire transcript.\n\n"
             f"{context_prompt}\n\n"
-            f"Video Content:\n{text}\n\n"
-            f"Summary:"
+            f"Transcript:\n{text}\n\n"
+            f"Key Points:"
         )
         
         try:
@@ -227,13 +290,14 @@ class FlanT5Summarizer:
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    min_length=min_length,
+                    min_length=max(30, min_length // 2),  # Reduce min_length to prevent echoing
                     max_length=max_length,
                     num_beams=4,
                     early_stopping=True,
                     no_repeat_ngram_size=3,
-                    temperature=0.7,
-                    top_p=0.9
+                    temperature=0.5,  # Lower temperature for more focused output
+                    top_p=0.85,
+                    length_penalty=0.5  # Penalize longer sequences to force condensing
                 )
             
             summary = self.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
@@ -262,93 +326,110 @@ class FlanT5Summarizer:
         Returns:
             Formatted summary string
         """
+        logger.info(f"  → Formatting: format={summary_format}, type={summary_type}, length={text_length}")
+        
         if summary_format == "bullet":
-            return self._to_bullet_points(text, text_length, summary_type)
+            result = self._to_bullet_points(text, text_length, summary_type)
+            logger.info(f"  → Bullet format applied")
+            return result
         elif summary_format == "structured":
-            return self._to_structured(text, summary_type, text_length)
+            result = self._to_structured(text, summary_type, text_length)
+            logger.info(f"  → Structured format applied")
+            return result
         else:  # "plain"
-            return self._to_plain(text)
-    
+            result = self._to_plain(text)
+            logger.info(f"  → Plain format applied")
+            return result
+
+    def _ensure_min_lines(self, sentences: List[str], min_lines: int, max_lines: Optional[int] = None) -> List[str]:
+        """
+        Ensure we have at least min_lines by splitting long sentences into clauses.
+        Keeps order and caps at max_lines when provided.
+        """
+        lines: List[str] = [s for s in sentences if s]
+        if len(lines) >= min_lines:
+            return lines[:max_lines] if max_lines else lines
+
+        for sentence in list(lines):
+            if len(lines) >= min_lines:
+                break
+            parts = re.split(r",|;|-", sentence)
+            for part in parts[1:]:
+                clean = part.strip()
+                if len(clean) > 3:
+                    lines.append(clean)
+                if len(lines) >= min_lines:
+                    break
+
+        if max_lines:
+            return lines[:max_lines]
+        return lines
+
     def _to_bullet_points(self, text: str, text_length: str, summary_type: str) -> str:
         """
-        Convert summary to bullet point format.
-        
-        Intelligently splits sentences and creates digestible bullet points.
+        Convert summary to bullet point format with minimum line counts per length.
         """
-        # Split on sentence boundaries
         sentences = re.split(r'[.!?]\s+', text)
         sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
-        
-        # Vary number of bullets by length
-        bullet_count = {
-            "short": 3,
-            "medium": 5,
-            "long": 8
+
+        target_lines = {
+            "short": 5,
+            "medium": 10,
+            "long": 18  # aim for 15-20, cap at 18 to stay within range
         }.get(text_length, 5)
-        
-        # Take the most relevant bullets
-        bullets = sentences[:bullet_count]
-        
-        # Format as bullet list
+
+        sentences = self._ensure_min_lines(sentences, target_lines, target_lines)
+        bullets = sentences[:target_lines]
+
         formatted_bullets = "\n".join([f"• {bullet.strip()}" for bullet in bullets])
-        
-        # Add header based on summary type
-        header = {
-            "balanced": "📹 Video Summary",
-            "visual_priority": "👀 Visual Summary",
-            "audio_priority": "🎧 Audio Summary",
-            "highlights": "⭐ Highlights"
-        }.get(summary_type, "📹 Summary")
-        
-        return f"{header}\n\n{formatted_bullets}"
-    
+
+        return f"\n{formatted_bullets}"
+
     def _to_structured(self, text: str, summary_type: str, text_length: str) -> str:
         """
-        Create a structured summary with organized sections.
-        Perfect for detailed reviews and analysis.
+        Create a structured summary with organized sections and enforced line counts.
         """
         sentences = re.split(r'[.!?]\s+', text)
         sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
-        
+
+        target_lines = {"short": 5, "medium": 10, "long": 18}.get(text_length, 10)
+        sentences = self._ensure_min_lines(sentences, target_lines, target_lines)
+
         type_title = {
             "balanced": "Video Summary",
             "visual_priority": "Visual Analysis",
             "audio_priority": "Audio Summary",
             "highlights": "Key Highlights"
         }.get(summary_type, "Summary")
-        
+
         if text_length == "short":
+            body = "\n".join(sentences[:target_lines])
             return (
-                f"## {type_title}\n\n"
-                f"{sentences[0] if sentences else text}.\n\n"
-                f"*[Auto-generated by VidSum GNN]*"
+                f"{type_title}\n\n"
+                f"{body}\n\n"
             )
-        
+
         elif text_length == "long":
-            result = f"## {type_title}\n\n"
-            
-            if sentences:
-                result += f"### Overview\n{sentences[0]}.\n\n"
-                
-                if len(sentences) > 1:
-                    mid_point = len(sentences) // 2
-                    result += f"### Key Points\n"
-                    result += "\n".join([f"- {s}" for s in sentences[1:mid_point]])
-                    result += "\n\n"
-                
-                if len(sentences) > 2:
-                    result += f"### Details\n"
-                    result += "\n".join([f"- {s}" for s in sentences[len(sentences)//2:]])
-                    result += "\n\n"
-            
-            result += f"*[Generated with Flan-T5 | Summary Type: {summary_type}]*"
+            result = f"{type_title}\n\n"
+
+            overview = sentences[:2]
+            key_points = sentences[2:10]
+            details = sentences[10:target_lines]
+
+            if overview:
+                result += "Overview\n" + "\n".join(overview) + "\n\n"
+            if key_points:
+                result += "Key Points\n" + "\n".join([f"- {s}" for s in key_points]) + "\n\n"
+            if details:
+                result += "Details\n" + "\n".join([f"- {s}" for s in details]) + "\n\n"
+
             return result
-        
+
         else:  # "medium"
-            result = f"## {type_title}\n\n"
-            result += f"{text}\n\n"
-            result += f"*[VidSum GNN Summary]*"
-            return result
+            body = "\n".join([f"- {s}" for s in sentences[:target_lines]])
+            return (
+                f"{body}\n\n"
+            )
     
     def _to_plain(self, text: str) -> str:
         """

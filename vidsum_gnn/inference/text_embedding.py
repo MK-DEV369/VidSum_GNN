@@ -3,13 +3,47 @@ Sentence-Transformers based text embedding service.
 Converts text to dense semantic vectors.
 """
 import numpy as np
+import time
 from pathlib import Path
 from typing import Optional
 from sentence_transformers import SentenceTransformer
+from requests.exceptions import ConnectionError, ChunkedEncodingError
+from urllib3.exceptions import IncompleteRead
 
 from vidsum_gnn.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def retry_with_backoff(func, max_retries=3, initial_delay=2):
+    """
+    Retry a function with exponential backoff on network errors.
+    
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds (doubles each retry)
+    
+    Returns:
+        Function result if successful
+        
+    Raises:
+        Last exception if all retries fail
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except (ConnectionError, ChunkedEncodingError, IncompleteRead, OSError) as e:
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} retry attempts failed")
+                raise
+            
+            delay = initial_delay * (2 ** attempt)
+            logger.warning(f"Network error (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}...")
+            logger.info(f"Retrying in {delay} seconds...")
+            time.sleep(delay)
+    
+    raise RuntimeError("Retry logic failed unexpectedly")
 
 
 class TextEmbedder:
@@ -31,7 +65,12 @@ class TextEmbedder:
         self.model_name = model_name
         
         logger.info(f"Loading text embedder: {model_name}")
-        self.model = SentenceTransformer(model_name, device=self.device)
+        
+        # Load with retry logic for network interruptions
+        self.model = retry_with_backoff(
+            lambda: SentenceTransformer(model_name, device=self.device)
+        )
+        
         logger.info(f"✓ Text embedder loaded on {self.device}")
     
     def encode(self, text: str, cache_path: Optional[Path] = None) -> np.ndarray:

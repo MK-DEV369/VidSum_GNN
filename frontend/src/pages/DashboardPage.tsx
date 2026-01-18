@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Upload, AlertCircle, CheckCircle, Clock } from "lucide-react";
+import { Upload, AlertCircle, CheckCircle, Clock, Download, Volume2, StopCircle, History, X, Trash2 } from "lucide-react";
 import axios from "axios";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -16,12 +16,24 @@ interface Log {
   progress?: number;
 }
 
+interface SummaryHistory {
+  id: string;
+  title: string;
+  summary: string;
+  format: SummaryFormat;
+  length: TextLength;
+  type: "balanced" | "visual" | "audio" | "highlight";
+  timestamp: string;
+  videoId: string;
+}
+
 interface ProcessingState {
   status: "idle" | "uploading" | "processing" | "completed" | "error";
   progress: number;
   currentStage: string;
   logs: Log[];
   summaryUrl?: string;
+  videoUrl?: string;
   error?: string;
 }
 
@@ -43,14 +55,57 @@ export default function DashboardPage() {
     logs: []
   });
   const [videoId, setVideoId] = useState<string>("");
+  const [processingConfig, setProcessingConfig] = useState<{format: SummaryFormat, length: TextLength, type: string} | null>(null);
   const [logsExpanded, setLogsExpanded] = useState<boolean>(false);
+  const [isReading, setIsReading] = useState<boolean>(false);
+  const [selectedVoice, setSelectedVoice] = useState<SpeechSynthesisVoice | null>(null);
+  const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const speechSynthesisRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const [showHistory, setShowHistory] = useState<boolean>(false);
+  const [summaryHistory, setSummaryHistory] = useState<SummaryHistory[]>([]);
+  const [selectedHistoryItem, setSelectedHistoryItem] = useState<SummaryHistory | null>(null);
 
   // Scroll logs to bottom
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [state.logs]);
+
+  // Load history from localStorage
+  useEffect(() => {
+    const stored = localStorage.getItem("summaryHistory");
+    if (stored) {
+      try {
+        setSummaryHistory(JSON.parse(stored));
+      } catch (e) {
+        console.error("Failed to load history:", e);
+      }
+    }
+  }, []);
+
+  // Load available voices
+  useEffect(() => {
+    const loadVoices = () => {
+      const voices = window.speechSynthesis.getVoices();
+      // Filter for only Google voices in English
+      const googleVoices = voices.filter(voice => 
+        voice.lang.startsWith('en') && voice.name.includes('Google')
+      );
+      setAvailableVoices(googleVoices);
+      
+      // Select first Google voice by default
+      const preferredVoice = googleVoices[0];
+      setSelectedVoice(preferredVoice);
+    };
+
+    loadVoices();
+    
+    // Chrome loads voices asynchronously
+    if (window.speechSynthesis.onvoiceschanged !== undefined) {
+      window.speechSynthesis.onvoiceschanged = loadVoices;
+    }
+  }, []);
 
   // Connect to WebSocket for logs
   useEffect(() => {
@@ -92,7 +147,8 @@ export default function DashboardPage() {
           progress: logData.progress ?? prev.progress,
           currentStage: logData.stage || prev.currentStage,
           status: isComplete ? "completed" : prev.status,
-          summaryUrl: isComplete ? `${API_BASE}/api/download/${videoId}` : prev.summaryUrl
+          summaryUrl: isComplete ? `${API_BASE}/api/download/${videoId}` : prev.summaryUrl,
+          videoUrl: isComplete ? `${API_BASE}/api/download/${videoId}` : prev.videoUrl
         }));
         
         // Fetch text summary when processing completes
@@ -138,18 +194,29 @@ export default function DashboardPage() {
 
   const fetchTextSummary = async (videoId: string) => {
     try {
+      // Use the format that was actually sent during processing
+      const formatToFetch = processingConfig?.format || summaryFormat;
       const response = await axios.get(`${API_BASE}/api/summary/${videoId}/text`, {
-        params: { format: summaryFormat }
+        params: { format: formatToFetch }
       });
       setTextSummary(response.data.summary);
+      
+      // Update the display to show actual format returned
+      const actualFormat = response.data.format || formatToFetch;
+      setSummaryFormat(actualFormat);
+      
       setState(prev => ({
         ...prev,
         logs: [...prev.logs, {
           timestamp: new Date().toISOString(),
           level: "SUCCESS",
-          message: `Text summary (${summaryFormat}) generated successfully`
+          message: `Text summary (${actualFormat}) generated successfully`
         }]
       }));
+      
+      // Save to history
+      const title = file?.name?.replace(/\.[^/.]+$/, "") || `Video ${videoId.slice(0, 8)}`;
+      saveToHistory(videoId, title, response.data.summary);
     } catch (error: any) {
       console.error("[Fetch Summary] Error:", error);
       setState(prev => ({
@@ -163,12 +230,122 @@ export default function DashboardPage() {
     }
   };
 
+  const saveToHistory = (videoId: string, title: string, summary: string) => {
+    const historyItem: SummaryHistory = {
+      id: `${videoId}_${Date.now()}`,
+      title: title,
+      summary: summary,
+      format: summaryFormat,
+      length: textLength,
+      type: summaryType,
+      timestamp: new Date().toISOString(),
+      videoId: videoId
+    };
+    
+    const updated = [historyItem, ...summaryHistory].slice(0, 50); // Keep last 50
+    setSummaryHistory(updated);
+    localStorage.setItem("summaryHistory", JSON.stringify(updated));
+  };
+
+  const clearHistory = () => {
+    if (confirm("Are you sure you want to clear all summary history?")) {
+      setSummaryHistory([]);
+      localStorage.removeItem("summaryHistory");
+      setSelectedHistoryItem(null);
+    }
+  };
+
+  const deleteHistoryItem = (id: string) => {
+    const updated = summaryHistory.filter(item => item.id !== id);
+    setSummaryHistory(updated);
+    localStorage.setItem("summaryHistory", JSON.stringify(updated));
+    if (selectedHistoryItem?.id === id) {
+      setSelectedHistoryItem(null);
+    }
+  };
+
   const handleReset = () => {
     setFile(null);
     setTextSummary(null);
     setState({ status: "idle", progress: 0, currentStage: "Waiting for upload...", logs: [] });
     setVideoId("");
+    setProcessingConfig(null);
+    setIsReading(false);
+    window.speechSynthesis.cancel();
     try { if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) wsRef.current.close(); } catch {}
+  };
+
+  const handleDownloadText = () => {
+    if (!textSummary) return;
+    const element = document.createElement("a");
+    const file = new Blob([textSummary], { type: "text/plain" });
+    element.href = URL.createObjectURL(file);
+    element.download = `summary_${videoId}_${textLength}_${summaryFormat}.txt`;
+    document.body.appendChild(element);
+    element.click();
+    document.body.removeChild(element);
+  };
+
+  const handleDownloadJSON = () => {
+    if (!textSummary) return;
+    const jsonData = {
+      video_id: videoId,
+      summary_format: summaryFormat,
+      text_length: textLength,
+      summary_type: summaryType,
+      content: textSummary,
+      generated_at: new Date().toISOString()
+    };
+    const element = document.createElement("a");
+    const file = new Blob([JSON.stringify(jsonData, null, 2)], { type: "application/json" });
+    element.href = URL.createObjectURL(file);
+    element.download = `summary_${videoId}_${textLength}_${summaryFormat}.json`;
+    document.body.appendChild(element);
+    element.click();
+    document.body.removeChild(element);
+  };
+
+  const handleReadAloud = () => {
+    if (!textSummary) return;
+
+    if (isReading) {
+      window.speechSynthesis.cancel();
+      setIsReading(false);
+      return;
+    }
+
+    // Clean text for speech (remove markdown formatting)
+    const cleanText = textSummary
+      .replace(/[•\-*]/g, "")
+      .replace(/[#*_`\[\]]/g, "")
+      .replace(/\n+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    
+    // Apply selected voice
+    if (selectedVoice) {
+      utterance.voice = selectedVoice;
+    }
+    
+    // Improved voice parameters for more natural speech
+    utterance.rate = 0.95;  // Slightly slower for clarity
+    utterance.pitch = 1.0;  // Natural pitch
+    utterance.volume = 1.0;
+
+    utterance.onend = () => {
+      setIsReading(false);
+    };
+
+    utterance.onerror = () => {
+      setIsReading(false);
+      console.error("Speech synthesis error");
+    };
+
+    speechSynthesisRef.current = utterance;
+    setIsReading(true);
+    window.speechSynthesis.speak(utterance);
   };
 
   const handleUpload = async () => {
@@ -178,6 +355,15 @@ export default function DashboardPage() {
     }
 
     setTextSummary(null);
+    
+    // Store the config being used for this processing
+    const config = {
+      format: summaryFormat,
+      length: textLength,
+      type: summaryType
+    };
+    setProcessingConfig(config);
+    
     setState(prev => ({
       ...prev,
       status: "uploading",
@@ -311,19 +497,26 @@ export default function DashboardPage() {
                   <Button 
                     onClick={handleUpload}
                     disabled={!file || state.status === "processing"}
-                    className="w-full"
+                    className="w-full bg-gradient-to-r from-violet-600 via-pink-500 to-blue-600 hover:from-violet-700 hover:via-pink-600 hover:to-blue-700 text-white font-semibold transition-all"
                   >
                     {state.status === "uploading" ? "Uploading..." : "Upload & Process"}
                   </Button>
                   <Button
                     onClick={handleReset}
                     disabled={state.status === "processing"}
-                    variant="outline"
-                    className="w-full"
+                    className="w-full bg-gradient-to-r from-pink-600 to-violet-600 hover:from-pink-700 hover:to-violet-700 text-white font-semibold transition-all"
                   >
                     Reset
                   </Button>
                 </div>
+
+                <Button
+                  onClick={() => setShowHistory(true)}
+                  className="w-full flex items-center gap-2 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-700 hover:to-blue-700 text-white font-semibold transition-all"
+                >
+                  <History className="w-4 h-4" />
+                  History ({summaryHistory.length})
+                </Button>
               </CardContent>
             </Card>
 
@@ -370,10 +563,13 @@ export default function DashboardPage() {
                         <Button
                           key={len}
                           size="sm"
-                          variant={textLength === len ? "default" : "outline"}
                           onClick={() => setTextLength(len)}
-                          disabled={state.status === "processing"}
-                          className="capitalize text-xs px-2"
+                          disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
+                          className={`capitalize text-xs px-2 font-semibold transition-all ${
+                            textLength === len
+                              ? "bg-gradient-to-r from-violet-600 to-blue-600 hover:from-violet-700 hover:to-blue-700 text-white"
+                              : "bg-gradient-to-r from-violet-500/30 to-blue-500/30 hover:from-violet-500/50 hover:to-blue-500/50 text-white border border-violet-500/50"
+                          }`}
                         >
                           {len}
                         </Button>
@@ -392,10 +588,13 @@ export default function DashboardPage() {
                         <Button
                           key={fmt}
                           size="sm"
-                          variant={summaryFormat === fmt ? "default" : "outline"}
                           onClick={() => setSummaryFormat(fmt)}
-                          disabled={state.status === "processing"}
-                          className="capitalize text-xs px-2"
+                          disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
+                          className={`capitalize text-xs px-2 font-semibold transition-all ${
+                            summaryFormat === fmt
+                              ? "bg-gradient-to-r from-pink-600 to-violet-600 hover:from-pink-700 hover:to-violet-700 text-white"
+                              : "bg-gradient-to-r from-pink-500/30 to-violet-500/30 hover:from-pink-500/50 hover:to-violet-500/50 text-white border border-pink-500/50"
+                          }`}
                         >
                           {fmt}
                         </Button>
@@ -413,53 +612,69 @@ export default function DashboardPage() {
                     Content Type
                   </GradientText>
                   <div className="grid grid-cols-2 gap-2">
-                    <label className="flex items-center gap-2 cursor-pointer hover:bg-white/10 px-2 py-1.5 rounded-md transition-colors">
+                    <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
+                      summaryType === "balanced"
+                        ? "bg-gradient-to-r from-violet-600 to-blue-600 text-white"
+                        : "bg-gradient-to-r from-violet-500/20 to-blue-500/20 text-white hover:from-violet-500/40 hover:to-blue-500/40 border border-violet-500/30"
+                    }`}>
                       <input 
                         type="radio"
                         name="summaryType"
                         value="balanced"
                         checked={summaryType === "balanced"}
                         onChange={(e) => setSummaryType(e.target.value as any)}
-                        disabled={state.status === "processing"}
-                        className="text-primary focus:ring-primary"
+                        disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
+                        className="accent-violet-400"
                       />
-                      <span className="text-xs font-medium text-white">Balanced</span>
+                      <span>Balanced</span>
                     </label>
-                    <label className="flex items-center gap-2 cursor-pointer hover:bg-white/10 px-2 py-1.5 rounded-md transition-colors">
+                    <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
+                      summaryType === "visual"
+                        ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
+                        : "bg-gradient-to-r from-pink-500/20 to-violet-500/20 text-white hover:from-pink-500/40 hover:to-violet-500/40 border border-pink-500/30"
+                    }`}>
                       <input 
                         type="radio"
                         name="summaryType"
                         value="visual"
                         checked={summaryType === "visual"}
                         onChange={(e) => setSummaryType(e.target.value as any)}
-                        disabled={state.status === "processing"}
-                        className="text-primary focus:ring-primary"
+                        disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
+                        className="accent-pink-400"
                       />
-                      <span className="text-xs font-medium text-white">Visual Priority</span>
+                      <span>Visual Priority</span>
                     </label>
-                    <label className="flex items-center gap-2 cursor-pointer hover:bg-white/10 px-2 py-1.5 rounded-md transition-colors">
+                    <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
+                      summaryType === "audio"
+                        ? "bg-gradient-to-r from-blue-600 to-cyan-600 text-white"
+                        : "bg-gradient-to-r from-blue-500/20 to-cyan-500/20 text-white hover:from-blue-500/40 hover:to-cyan-500/40 border border-blue-500/30"
+                    }`}>
                       <input 
                         type="radio"
                         name="summaryType"
                         value="audio"
                         checked={summaryType === "audio"}
                         onChange={(e) => setSummaryType(e.target.value as any)}
-                        disabled={state.status === "processing"}
-                        className="text-primary focus:ring-primary"
+                        disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
+                        className="accent-blue-400"
                       />
-                      <span className="text-xs font-medium text-white">Audio Priority</span>
+                      <span>Audio Priority</span>
                     </label>
-                    <label className="flex items-center gap-2 cursor-pointer hover:bg-white/10 px-2 py-1.5 rounded-md transition-colors">
+                    <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
+                      summaryType === "highlight"
+                        ? "bg-gradient-to-r from-violet-600 via-pink-600 to-blue-600 text-white"
+                        : "bg-gradient-to-r from-violet-500/20 via-pink-500/20 to-blue-500/20 text-white hover:from-violet-500/40 hover:via-pink-500/40 hover:to-blue-500/40 border border-pink-500/30"
+                    }`}>
                       <input 
                         type="radio"
                         name="summaryType"
                         value="highlight"
                         checked={summaryType === "highlight"}
                         onChange={(e) => setSummaryType(e.target.value as any)}
-                        disabled={state.status === "processing"}
-                        className="text-primary focus:ring-primary"
+                        disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
+                        className="accent-pink-400"
                       />
-                      <span className="text-xs font-medium text-white">Highlight</span>
+                      <span>Highlight</span>
                     </label>
                   </div>
                 </div>
@@ -471,26 +686,144 @@ export default function DashboardPage() {
           <div className="col-span-2 flex flex-col gap-4 overflow-hidden">
             {state.status === "completed" || textSummary ? (
               <>
-                {/* Text Summary */}
+                {/* Merged Video Player - Top Section */}
+                {state.videoUrl && (
+                  <Card className="flex-1 bg-white/10 border-white/20 backdrop-blur-sm flex flex-col min-h-[45%]">
+                    <CardHeader className="pb-2">
+                      <CardTitle className="text-base">
+                        <GradientText
+                          colors={['#ec4899', '#f97316', '#ec4899', '#f97316', '#ec4899']}
+                          animationSpeed={4}
+                        >
+                          Important Shots Compilation
+                        </GradientText>
+                      </CardTitle>
+                    </CardHeader>
+                    <CardContent className="flex-1 flex items-center justify-center overflow-hidden relative">
+                      <video
+                        key={state.videoUrl}
+                        controls
+                        preload="metadata"
+                        playsInline
+                        className="w-full h-full object-contain rounded-lg"
+                        style={{ maxHeight: "100%" }}
+                        onError={(e) => {
+                          console.error("[Video] Failed to load:", state.videoUrl);
+                          console.error("[Video] Error details:", e);
+                        }}
+                        onLoadedMetadata={() => {
+                          console.log("[Video] Loaded successfully:", state.videoUrl);
+                        }}
+                      >
+                        <source src={`${state.videoUrl}?t=${Date.now()}`} type="video/mp4" />
+                        Your browser does not support the video tag.
+                      </video>
+                      
+
+                    </CardContent>
+                  </Card>
+                )}
+
+                {/* Text Summary - Bottom Section */}
                 {textSummary && (
-                  <Card className="flex-1 bg-white/10 border-white/20 backdrop-blur-sm">
+                  <Card className={`${state.videoUrl ? 'flex-1 min-h-[50%]' : 'flex-1'} bg-white/10 border-white/20 backdrop-blur-sm flex flex-col overflow-hidden`}>
                     <CardHeader className="pb-3">
                       <CardTitle className="text-base">
                         <GradientText
                           colors={['#10b981', '#06b6d4', '#3b82f6', '#06b6d4', '#10b981']}
                           animationSpeed={4}
                         >
-                          Text Summary ({summaryFormat} • {textLength})
+                          Text Summary ({processingConfig?.format || summaryFormat} • {processingConfig?.length || textLength})
                         </GradientText>
                       </CardTitle>
                     </CardHeader>
-                    <CardContent className="h-[calc(100%-60px)] overflow-y-auto">
+                    <CardContent className="flex-1 overflow-y-auto mb-4">
                       <div className="bg-white/5 rounded-lg p-4 prose prose-sm max-w-none">
                         <pre className="whitespace-pre-wrap font-sans text-sm text-white">
                           {textSummary}
                         </pre>
                       </div>
                     </CardContent>
+                    
+                    {/* Action Buttons - Compact Layout */}
+                    <div className="px-6 pb-4 border-t border-white/10 pt-4">
+                      <div className="grid grid-cols-5 gap-2 items-end">
+                        {/* Download TXT Button */}
+                        <Button
+                          onClick={handleDownloadText}
+                          className="flex items-center justify-center gap-1 bg-gradient-to-r from-violet-600 to-blue-600 hover:from-violet-700 hover:to-blue-700 text-white font-semibold transition-all text-xs py-2"
+                          title="Download as TXT"
+                        >
+                          <Download className="w-3 h-3" />
+                          TXT
+                        </Button>
+
+                        {/* Download JSON Button */}
+                        <Button
+                          onClick={handleDownloadJSON}
+                          className="flex items-center justify-center gap-1 bg-gradient-to-r from-pink-600 to-violet-600 hover:from-pink-700 hover:to-violet-700 text-white font-semibold transition-all text-xs py-2"
+                          title="Download as JSON"
+                        >
+                          <Download className="w-3 h-3" />
+                          JSON
+                        </Button>
+
+                        {/* Voice Selection Dropdown */}
+                        {availableVoices.length > 0 && (
+                          <div className="col-span-2">
+                            <select
+                              value={selectedVoice?.name || ''}
+                              onChange={(e) => {
+                                const voice = availableVoices.find(v => v.name === e.target.value);
+                                setSelectedVoice(voice || null);
+                              }}
+                              className="w-full bg-white/10 border border-white/20 rounded-lg px-2 py-2 text-xs text-white focus:outline-none focus:border-violet-500 transition-colors"
+                              title="Select voice for text-to-speech"
+                            >
+                              {availableVoices.map((voice) => (
+                                  <option 
+                                    key={voice.name} 
+                                    value={voice.name}
+                                    className="bg-gray-900 text-white"
+                                  >
+                                    {voice.name} {voice.localService ? '🌐' : '☁️'}
+                                  </option>
+                                ))}
+                            </select>
+                          </div>
+                        )}
+
+                        {/* Read Aloud Button */}
+                        <Button
+                          onClick={handleReadAloud}
+                          className={`flex items-center justify-center gap-1 py-2 font-semibold transition-all duration-200 text-xs ${
+                            isReading
+                              ? "bg-gradient-to-r from-red-600 to-pink-600 hover:from-red-700 hover:to-pink-700"
+                              : "bg-gradient-to-r from-violet-600 via-pink-500 to-blue-600 hover:from-violet-700 hover:via-pink-600 hover:to-blue-700"
+                          } text-white`}
+                          title={isReading ? "Stop reading" : "Read aloud with text-to-speech"}
+                        >
+                          {isReading ? (
+                            <>
+                              <StopCircle className="w-3 h-3" />
+                              Stop
+                            </>
+                          ) : (
+                            <>
+                              <Volume2 className="w-3 h-3" />
+                              Read
+                            </>
+                          )}
+                        </Button>
+                      </div>
+
+                      {/* Reading Status Indicator */}
+                      {isReading && (
+                        <div className="text-center text-xs text-emerald-400 animate-pulse font-semibold mt-2">
+                          🔊 Reading aloud...
+                        </div>
+                      )}
+                    </div>
                   </Card>
                 )}
               </>
@@ -500,7 +833,7 @@ export default function DashboardPage() {
                   <p className="text-white text-center">
                     {state.status === "idle" 
                       ? "Upload a video to start" 
-                      : "Processing... summary will appear here"}
+                      : "Processing... video compilation and summary will appear here"}
                   </p>
                 </CardContent>
               </Card>
@@ -557,7 +890,141 @@ export default function DashboardPage() {
           </Card>
         </div>
       </div>
-      </div>
+    </div>
+
+      {/* History Modal */}
+      {showHistory && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <Card className="w-full max-w-2xl max-h-[80vh] bg-slate-950 border-white/20 backdrop-blur-sm flex flex-col">
+            <CardHeader className="flex items-center justify-between border-b border-white/10 pb-3">
+              <CardTitle className="flex items-center gap-2 text-lg">
+                <History className="w-5 h-5 text-cyan-400" />
+                <GradientText
+                  colors={['#06b6d4', '#0ea5e9', '#06b6d4', '#0ea5e9', '#06b6d4']}
+                  animationSpeed={4}
+                >
+                  Summary History
+                </GradientText>
+              </CardTitle>
+              <Button
+                onClick={() => setShowHistory(false)}
+                variant="ghost"
+                size="sm"
+                className="hover:bg-white/10"
+              >
+                <X className="w-4 h-4" />
+              </Button>
+            </CardHeader>
+
+            <CardContent className="flex-1 overflow-hidden flex gap-4 p-4">
+              {/* History List */}
+              <div className="w-1/3 border-r border-white/10 overflow-y-auto pr-4 space-y-2">
+                {summaryHistory.length === 0 ? (
+                  <p className="text-xs text-slate-400 text-center py-8">No history yet</p>
+                ) : (
+                  summaryHistory.map((item) => (
+                    <button
+                      key={item.id}
+                      onClick={() => setSelectedHistoryItem(item)}
+                      className={`w-full text-left p-2 rounded-lg transition-all text-xs ${
+                        selectedHistoryItem?.id === item.id
+                          ? "bg-gradient-to-r from-cyan-600/50 to-blue-600/50 border border-cyan-400/50"
+                          : "bg-white/5 hover:bg-white/10 border border-white/10"
+                      }`}
+                    >
+                      <p className="font-medium text-white truncate">{item.title}</p>
+                      <p className="text-slate-400 text-xs">
+                        {item.format} • {item.length}
+                      </p>
+                      <p className="text-slate-500 text-xs">
+                        {new Date(item.timestamp).toLocaleDateString()} {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </p>
+                    </button>
+                  ))
+                )}
+              </div>
+
+              {/* Preview Section */}
+              <div className="flex-1 overflow-y-auto flex flex-col gap-3">
+                {selectedHistoryItem ? (
+                  <>
+                    <div className="space-y-2 pb-3 border-b border-white/10">
+                      <h3 className="font-semibold text-white">{selectedHistoryItem.title}</h3>
+                      <div className="flex flex-wrap gap-2 text-xs">
+                        <span className="bg-cyan-600/30 text-cyan-300 px-2 py-1 rounded">
+                          {selectedHistoryItem.format}
+                        </span>
+                        <span className="bg-blue-600/30 text-blue-300 px-2 py-1 rounded">
+                          {selectedHistoryItem.length}
+                        </span>
+                        <span className="bg-purple-600/30 text-purple-300 px-2 py-1 rounded capitalize">
+                          {selectedHistoryItem.type}
+                        </span>
+                      </div>
+                      <p className="text-slate-400 text-xs">
+                        {new Date(selectedHistoryItem.timestamp).toLocaleString()}
+                      </p>
+                    </div>
+
+                    {/* Summary Text */}
+                    <div className="flex-1 overflow-y-auto">
+                      <pre className="whitespace-pre-wrap font-sans text-xs text-slate-200 bg-white/5 p-3 rounded-lg">
+                        {selectedHistoryItem.summary}
+                      </pre>
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div className="flex gap-2 pt-3 border-t border-white/10">
+                      <Button
+                        onClick={() => {
+                          const element = document.createElement("a");
+                          const file = new Blob([selectedHistoryItem.summary], { type: "text/plain" });
+                          element.href = URL.createObjectURL(file);
+                          element.download = `summary_${selectedHistoryItem.title}_${selectedHistoryItem.format}.txt`;
+                          document.body.appendChild(element);
+                          element.click();
+                          document.body.removeChild(element);
+                        }}
+                        className="flex-1 flex items-center gap-2 bg-gradient-to-r from-violet-600 to-blue-600 hover:from-violet-700 hover:to-blue-700 text-white text-xs font-semibold py-2"
+                      >
+                        <Download className="w-3 h-3" />
+                        Download
+                      </Button>
+                      <Button
+                        onClick={() => deleteHistoryItem(selectedHistoryItem.id)}
+                        className="flex items-center gap-2 bg-gradient-to-r from-red-600 to-pink-600 hover:from-red-700 hover:to-pink-700 text-white text-xs font-semibold py-2 px-3"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex items-center justify-center h-full text-slate-400">
+                    <p className="text-center text-xs">Select a history item to preview</p>
+                  </div>
+                )}
+              </div>
+            </CardContent>
+
+            {/* Footer Actions */}
+            <div className="border-t border-white/10 p-4 flex gap-2 justify-end">
+              <Button
+                onClick={clearHistory}
+                disabled={summaryHistory.length === 0}
+                className="bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-700 hover:to-orange-700 text-white text-xs font-semibold disabled:opacity-50"
+              >
+                Clear All
+              </Button>
+              <Button
+                onClick={() => setShowHistory(false)}
+                className="bg-gradient-to-r from-slate-600 to-slate-700 hover:from-slate-700 hover:to-slate-800 text-white text-xs font-semibold"
+              >
+                Close
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }

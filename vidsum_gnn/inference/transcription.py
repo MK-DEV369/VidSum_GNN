@@ -5,13 +5,47 @@ Handles speech-to-text conversion with caching support.
 import torch
 import librosa
 import json
+import time
 from pathlib import Path
 from typing import Optional
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from requests.exceptions import ConnectionError, ChunkedEncodingError
+from urllib3.exceptions import IncompleteRead
 
 from vidsum_gnn.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def retry_with_backoff(func, max_retries=3, initial_delay=2):
+    """
+    Retry a function with exponential backoff on network errors.
+    
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds (doubles each retry)
+    
+    Returns:
+        Function result if successful
+        
+    Raises:
+        Last exception if all retries fail
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except (ConnectionError, ChunkedEncodingError, IncompleteRead, OSError) as e:
+            if attempt == max_retries - 1:
+                logger.error(f"All {max_retries} retry attempts failed")
+                raise
+            
+            delay = initial_delay * (2 ** attempt)
+            logger.warning(f"Network error (attempt {attempt + 1}/{max_retries}): {str(e)[:100]}...")
+            logger.info(f"Retrying in {delay} seconds...")
+            time.sleep(delay)
+    
+    raise RuntimeError("Retry logic failed unexpectedly")
 
 
 class WhisperTranscriber:
@@ -29,8 +63,23 @@ class WhisperTranscriber:
         self.model_name = model_name
         
         logger.info(f"Loading Whisper model: {model_name}")
-        self.processor = WhisperProcessor.from_pretrained(model_name)
-        self.model = WhisperForConditionalGeneration.from_pretrained(model_name).to(self.device)
+        
+        # Load with retry logic for network interruptions
+        self.processor = retry_with_backoff(
+            lambda: WhisperProcessor.from_pretrained(
+                model_name,
+                resume_download=True,
+                force_download=False
+            )
+        )
+        
+        self.model = retry_with_backoff(
+            lambda: WhisperForConditionalGeneration.from_pretrained(
+                model_name,
+                resume_download=True,
+                force_download=False
+            ).to(self.device)
+        )
         self.model.eval()
         
         logger.info(f"✓ Whisper loaded on {self.device}")
@@ -76,6 +125,12 @@ class WhisperTranscriber:
                 logger.warning(f"Audio loaded but empty: {audio_path}")
                 return ""
             
+            # Skip very short audio (< 0.5 seconds) - usually UI noise
+            duration = len(audio) / 16000
+            if duration < 0.5:
+                logger.debug(f"Skipping very short audio ({duration:.2f}s): {audio_path}")
+                return ""
+            
             # Process through Whisper
             inputs = self.processor(audio, sampling_rate=16000, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -83,13 +138,25 @@ class WhisperTranscriber:
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     inputs["input_features"],
-                    max_new_tokens=128
+                    max_new_tokens=128,
+                    language="<|en|>"  # Force English
                 )
             
             transcription = self.processor.batch_decode(
                 generated_ids,
                 skip_special_tokens=True
-            )[0]
+            )[0].strip()
+            
+            # Filter garbage transcriptions (all special chars, very short, etc.)
+            if len(transcription) < 3:
+                logger.debug(f"Transcription too short (<3 chars): {audio_path}")
+                return ""
+            
+            # Check if transcription is mostly alphanumeric (filter garbage like "a b c d e f")
+            alphanumeric_count = sum(1 for c in transcription if c.isalnum() or c.isspace())
+            if alphanumeric_count / len(transcription) < 0.7:
+                logger.warning(f"Transcription quality too low (mostly symbols): {transcription[:50]}")
+                return ""
             
             # Cache result
             if cache_dir and cache_file:
@@ -121,3 +188,19 @@ class WhisperTranscriber:
             List of transcriptions (empty string for failed files)
         """
         return [self.transcribe(path, cache_dir) for path in audio_paths]
+
+
+class TranscriptionService:
+    """Thin wrapper used by the pipeline to keep a stable interface."""
+
+    def __init__(self, model_name: str = "openai/whisper-base", device: Optional[str] = None):
+        self.transcriber = WhisperTranscriber(model_name=model_name, device=device)
+
+    def transcribe_audio(self, audio_path: Path | str, cache_dir: Optional[Path | str] = None) -> str:
+        cache_path = Path(cache_dir) if cache_dir else None
+        return self.transcriber.transcribe(Path(audio_path), cache_dir=cache_path)
+
+    def transcribe_batch(self, audio_paths: list[Path | str], cache_dir: Optional[Path | str] = None) -> list[str]:
+        cache_path = Path(cache_dir) if cache_dir else None
+        paths = [Path(p) for p in audio_paths]
+        return self.transcriber.batch_transcribe(paths, cache_dir=cache_path)
