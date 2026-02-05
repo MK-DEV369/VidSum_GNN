@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Upload, AlertCircle, CheckCircle, Clock, Download, Volume2, StopCircle, History, X, Trash2 } from "lucide-react";
+import { Upload, AlertCircle, CheckCircle, Clock, Download, Volume2, StopCircle, History, X, Trash2, ChevronDown, ChevronUp } from "lucide-react";
 import axios from "axios";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -22,7 +22,7 @@ interface SummaryHistory {
   summary: string;
   format: SummaryFormat;
   length: TextLength;
-  type: "balanced" | "visual" | "audio" | "highlight";
+  type: "balanced" | "visual_priority" | "audio_priority" | "highlights";
   timestamp: string;
   videoId: string;
 }
@@ -35,19 +35,70 @@ interface ProcessingState {
   summaryUrl?: string;
   videoUrl?: string;
   error?: string;
+  processingStartedAt?: string;
+  processingCompletedAt?: string;
+  processingDurationSec?: number;
 }
+
+type TtsVoice = {
+  short_name: string;
+  friendly_name?: string | null;
+  locale?: string | null;
+  gender?: string | null;
+};
 
 type TextLength = "short" | "medium" | "long";
 type SummaryFormat = "bullet" | "structured" | "plain";
+type SummaryType = "balanced" | "visual_priority" | "audio_priority" | "highlights";
 
-const API_BASE = "http://localhost:8000";
+type EvidenceItem = {
+  index?: number | null;
+  bullet?: string | null;
+  shot_index?: number | null;
+  shot_id?: string | null;
+  orig_start?: number | null;
+  orig_end?: number | null;
+  merged_start?: number | null;
+  merged_end?: number | null;
+  score?: number | null;
+  transcript_snippet?: string | null;
+  thumbnail_url?: string | null;
+  signals?: {
+    motion?: number | null;
+    audio_rms?: number | null;
+    scene_change?: number | null;
+    transcript_density?: number | null;
+    duration_sec?: number | null;
+  } | null;
+  neighbors?: Array<{
+    neighbor_index: number;
+    edge_type: "temporal" | "semantic";
+    similarity?: number | null;
+    distance_sec?: number | null;
+  }> | null;
+};
+
+type ChapterItem = {
+  index: number;
+  title: string;
+  merged_start: number;
+  merged_end: number;
+  shot_indices?: number[];
+};
+
+const API_BASE = `${window.location.protocol}//${window.location.hostname}:8000`;
 
 export default function DashboardPage() {
   const [file, setFile] = useState<File | null>(null);
   const [textLength, setTextLength] = useState<TextLength>("medium");
   const [summaryFormat, setSummaryFormat] = useState<SummaryFormat>("bullet");
-  const [summaryType, setSummaryType] = useState<"balanced" | "visual" | "audio" | "highlight">("balanced");
+  const [summaryType, setSummaryType] = useState<SummaryType>("balanced");
   const [textSummary, setTextSummary] = useState<string | null>(null);
+  const [evidenceItems, setEvidenceItems] = useState<EvidenceItem[]>([]);
+  const [chapters, setChapters] = useState<ChapterItem[]>([]);
+  const [showChaptersPanel, setShowChaptersPanel] = useState<boolean>(true);
+  const [showEvidencePanel, setShowEvidencePanel] = useState<boolean>(true);
+  const [expandedEvidenceKey, setExpandedEvidenceKey] = useState<string | null>(null);
   const [state, setState] = useState<ProcessingState>({
     status: "idle",
     progress: 0,
@@ -55,14 +106,20 @@ export default function DashboardPage() {
     logs: []
   });
   const [videoId, setVideoId] = useState<string>("");
-  const [processingConfig, setProcessingConfig] = useState<{format: SummaryFormat, length: TextLength, type: string} | null>(null);
+  const [processingConfig, setProcessingConfig] = useState<{format: SummaryFormat, length: TextLength, type: SummaryType} | null>(null);
   const [logsExpanded, setLogsExpanded] = useState<boolean>(false);
   const [isReading, setIsReading] = useState<boolean>(false);
-  const [selectedVoice, setSelectedVoice] = useState<SpeechSynthesisVoice | null>(null);
-  const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [ttsVoices, setTtsVoices] = useState<TtsVoice[]>([]);
+  const [selectedTtsVoice, setSelectedTtsVoice] = useState<string>("");
+  const [ttsRate, setTtsRate] = useState<number>(1.0);
   const wsRef = useRef<WebSocket | null>(null);
+  const didHandleCompleteForVideoRef = useRef<string | null>(null);
+  const didFetchSummaryForVideoRef = useRef<string | null>(null);
+  const didFetchEvidenceForVideoRef = useRef<string | null>(null);
+  const didFetchChaptersForVideoRef = useRef<string | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
-  const speechSynthesisRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const [showHistory, setShowHistory] = useState<boolean>(false);
   const [summaryHistory, setSummaryHistory] = useState<SummaryHistory[]>([]);
   const [selectedHistoryItem, setSelectedHistoryItem] = useState<SummaryHistory | null>(null);
@@ -84,32 +141,33 @@ export default function DashboardPage() {
     }
   }, []);
 
-  // Load available voices
+  // Load available AI TTS voices from backend (non-browser speech)
   useEffect(() => {
-    const loadVoices = () => {
-      const voices = window.speechSynthesis.getVoices();
-      // Filter for only Google voices in English
-      const googleVoices = voices.filter(voice => 
-        voice.lang.startsWith('en') && voice.name.includes('Google')
-      );
-      setAvailableVoices(googleVoices);
-      
-      // Select first Google voice by default
-      const preferredVoice = googleVoices[0];
-      setSelectedVoice(preferredVoice);
+    const loadTtsVoices = async () => {
+      try {
+        const resp = await axios.get(`${API_BASE}/api/tts/voices`);
+        const voices = (resp.data?.voices || []) as TtsVoice[];
+        setTtsVoices(voices);
+        if (!selectedTtsVoice && voices.length > 0) {
+          setSelectedTtsVoice(voices[0].short_name);
+        }
+      } catch (e) {
+        console.warn("[TTS] Failed to load voices", e);
+        setTtsVoices([]);
+      }
     };
-
-    loadVoices();
-    
-    // Chrome loads voices asynchronously
-    if (window.speechSynthesis.onvoiceschanged !== undefined) {
-      window.speechSynthesis.onvoiceschanged = loadVoices;
-    }
+    loadTtsVoices();
   }, []);
 
   // Connect to WebSocket for logs
   useEffect(() => {
     if (!videoId) return;
+
+    // New video: reset per-video fetch guards
+    didHandleCompleteForVideoRef.current = null;
+    didFetchSummaryForVideoRef.current = null;
+    didFetchEvidenceForVideoRef.current = null;
+    didFetchChaptersForVideoRef.current = null;
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.hostname}:8000/ws/logs/${videoId}`;
@@ -151,9 +209,23 @@ export default function DashboardPage() {
           videoUrl: isComplete ? `${API_BASE}/api/download/${videoId}` : prev.videoUrl
         }));
         
-        // Fetch text summary when processing completes
+        // Fetch result payloads when processing completes (once per videoId)
         if (isComplete) {
-          fetchTextSummary(videoId);
+          if (didHandleCompleteForVideoRef.current !== videoId) {
+            didHandleCompleteForVideoRef.current = videoId;
+
+            didFetchSummaryForVideoRef.current = videoId;
+            fetchTextSummary(videoId);
+
+            if (showEvidencePanel) {
+              didFetchEvidenceForVideoRef.current = videoId;
+              fetchEvidence(videoId);
+            }
+            if (showChaptersPanel) {
+              didFetchChaptersForVideoRef.current = videoId;
+              fetchChapters(videoId);
+            }
+          }
         }
       } catch (err) {
         console.error("[WebSocket] Parse error:", err);
@@ -176,6 +248,33 @@ export default function DashboardPage() {
       }
     };
   }, [videoId]);
+
+  // If user enables panels after completion, lazy-load their data.
+  useEffect(() => {
+    if (!videoId) return;
+    if (state.status !== "completed") return;
+    if (!showEvidencePanel) return;
+    if (didFetchEvidenceForVideoRef.current === videoId) return;
+    if (evidenceItems.length > 0) {
+      didFetchEvidenceForVideoRef.current = videoId;
+      return;
+    }
+    didFetchEvidenceForVideoRef.current = videoId;
+    fetchEvidence(videoId);
+  }, [showEvidencePanel, videoId, state.status]);
+
+  useEffect(() => {
+    if (!videoId) return;
+    if (state.status !== "completed") return;
+    if (!showChaptersPanel) return;
+    if (didFetchChaptersForVideoRef.current === videoId) return;
+    if (chapters.length > 0) {
+      didFetchChaptersForVideoRef.current = videoId;
+      return;
+    }
+    didFetchChaptersForVideoRef.current = videoId;
+    fetchChapters(videoId);
+  }, [showChaptersPanel, videoId, state.status]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -207,6 +306,9 @@ export default function DashboardPage() {
       
       setState(prev => ({
         ...prev,
+        processingStartedAt: response.data.processing_started_at ?? prev.processingStartedAt,
+        processingCompletedAt: response.data.processing_completed_at ?? prev.processingCompletedAt,
+        processingDurationSec: typeof response.data.processing_duration_sec === "number" ? response.data.processing_duration_sec : prev.processingDurationSec,
         logs: [...prev.logs, {
           timestamp: new Date().toISOString(),
           level: "SUCCESS",
@@ -225,6 +327,146 @@ export default function DashboardPage() {
           timestamp: new Date().toISOString(),
           level: "WARNING",
           message: "Could not fetch text summary"
+        }]
+      }));
+    }
+  };
+
+  const formatTime = (seconds: number | null | undefined) => {
+    if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return "--:--";
+    const total = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+    return `${m}:${String(s).padStart(2, "0")}`;
+  };
+
+  const normalizeStageKey = (stage: string | null | undefined) => {
+    const s = String(stage || "").toLowerCase();
+    if (!s) return "idle";
+    if (s.includes("upload")) return "upload";
+    if (s.includes("queue")) return "queued";
+    if (s.includes("preprocess")) return "preprocessing";
+    if (s.includes("shot")) return "shot_detection";
+    if (s.includes("feature")) return "feature_extraction";
+    if (s.includes("gnn") || s.includes("inference") || s.includes("score")) return "gnn_inference";
+    if (s.includes("merge")) return "video_merge";
+    if (s.includes("assem") || s.includes("summ") || s.includes("format")) return "assembling";
+    if (s.includes("complete") || s.includes("done")) return "completed";
+    if (s.includes("fail") || s.includes("error")) return "failed";
+    return s;
+  };
+
+  const stageLabel = (stage: string | null | undefined) => {
+    const key = normalizeStageKey(stage);
+    const map: Record<string, string> = {
+      idle: "Waiting",
+      upload: "Uploading",
+      queued: "Queued",
+      preprocessing: "Preparing",
+      shot_detection: "Detecting Shots",
+      feature_extraction: "Extracting",
+      gnn_inference: "Scoring",
+      video_merge: "Merging",
+      assembling: "Summarizing",
+      completed: "Completed",
+      failed: "Failed",
+    };
+    return map[key] || String(stage || "Processing");
+  };
+
+  const formatChapterTitle = (rawTitle: string | null | undefined, chapterIndex: number) => {
+    const t = String(rawTitle || "").trim();
+    if (!t) return `Chapter ${chapterIndex + 1}`;
+
+    // Normalize older/odd formats like: "word . word . word" or "word | word | word"
+    let normalized = t
+      .replace(/\s+\.\s+/g, " · ")
+      .replace(/\s+\|\s+/g, " · ")
+      .replace(/\s+•\s+/g, " · ")
+      .replace(/\s*·\s*/g, " · ");
+
+    const parts = normalized
+      .split(" · ")
+      .map(p => p.trim())
+      .filter(Boolean);
+
+    if (parts.length >= 3) return parts.slice(0, 3).join(" · ");
+    return normalized;
+  };
+
+  const stageBarClass = (stage: string | null | undefined) => {
+    const key = normalizeStageKey(stage);
+    if (key === "failed") return "bg-gradient-to-r from-red-600 via-pink-600 to-red-600";
+    if (key === "completed") return "bg-gradient-to-r from-emerald-500 via-cyan-500 to-emerald-500";
+    if (key === "upload") return "bg-gradient-to-r from-violet-600 via-pink-500 to-blue-600";
+    if (key === "shot_detection") return "bg-gradient-to-r from-amber-500 via-orange-500 to-pink-500";
+    if (key === "feature_extraction") return "bg-gradient-to-r from-cyan-500 via-blue-500 to-violet-500";
+    if (key === "gnn_inference") return "bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600";
+    if (key === "video_merge") return "bg-gradient-to-r from-fuchsia-600 via-pink-600 to-amber-500";
+    return "bg-gradient-to-r from-violet-600 via-pink-500 to-blue-600";
+  };
+
+  const fetchEvidence = async (videoId: string) => {
+    try {
+      const response = await axios.get(`${API_BASE}/api/summary/${videoId}/evidence`);
+      const items = (response.data?.items || []) as EvidenceItem[];
+      setEvidenceItems(items);
+
+      didFetchEvidenceForVideoRef.current = videoId;
+
+      if (items.length > 0) {
+        setState(prev => ({
+          ...prev,
+          logs: [...prev.logs, {
+            timestamp: new Date().toISOString(),
+            level: "SUCCESS",
+            message: `Evidence-linked highlights loaded (${items.length})`
+          }]
+        }));
+      }
+    } catch (error: any) {
+      console.error("[Fetch Evidence] Error:", error);
+      setEvidenceItems([]);
+      setState(prev => ({
+        ...prev,
+        logs: [...prev.logs, {
+          timestamp: new Date().toISOString(),
+          level: "WARNING",
+          message: "Could not fetch evidence-linked highlights"
+        }]
+      }));
+    }
+  };
+
+  const fetchChapters = async (videoId: string) => {
+    try {
+      const response = await axios.get(`${API_BASE}/api/summary/${videoId}/chapters`);
+      const items = (response.data?.items || []) as ChapterItem[];
+      setChapters(items);
+
+      didFetchChaptersForVideoRef.current = videoId;
+
+      if (items.length > 0) {
+        setState(prev => ({
+          ...prev,
+          logs: [...prev.logs, {
+            timestamp: new Date().toISOString(),
+            level: "SUCCESS",
+            message: `Chapters generated (${items.length})`
+          }]
+        }));
+      }
+    } catch (error: any) {
+      console.error("[Fetch Chapters] Error:", error);
+      setChapters([]);
+      setState(prev => ({
+        ...prev,
+        logs: [...prev.logs, {
+          timestamp: new Date().toISOString(),
+          level: "WARNING",
+          message: "Could not fetch chapters"
         }]
       }));
     }
@@ -267,12 +509,39 @@ export default function DashboardPage() {
   const handleReset = () => {
     setFile(null);
     setTextSummary(null);
+    setEvidenceItems([]);
+    setChapters([]);
+    setExpandedEvidenceKey(null);
     setState({ status: "idle", progress: 0, currentStage: "Waiting for upload...", logs: [] });
     setVideoId("");
     setProcessingConfig(null);
+    didHandleCompleteForVideoRef.current = null;
+    didFetchSummaryForVideoRef.current = null;
+    didFetchEvidenceForVideoRef.current = null;
+    didFetchChaptersForVideoRef.current = null;
     setIsReading(false);
-    window.speechSynthesis.cancel();
+    try {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+      }
+    } catch {}
     try { if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) wsRef.current.close(); } catch {}
+  };
+
+  const getSignalStats = () => {
+    const keys = ["motion", "audio_rms", "scene_change", "transcript_density"] as const;
+    const stats: Record<string, { min: number; max: number }> = {};
+
+    for (const k of keys) {
+      const vals = evidenceItems
+        .map(it => it.signals?.[k])
+        .filter((v): v is number => typeof v === "number" && !Number.isNaN(v));
+      const min = vals.length ? Math.min(...vals) : 0;
+      const max = vals.length ? Math.max(...vals) : 1;
+      stats[k] = { min, max };
+    }
+    return stats;
   };
 
   const handleDownloadText = () => {
@@ -305,11 +574,118 @@ export default function DashboardPage() {
     document.body.removeChild(element);
   };
 
+  const formatEvidenceExport = (items: EvidenceItem[]) => {
+    const generatedAt = new Date().toISOString();
+    const lines: string[] = [];
+
+    lines.push("Evidence-linked highlights export");
+    if (videoId) lines.push(`Video ID: ${videoId}`);
+    lines.push(`Generated at: ${generatedAt}`);
+    lines.push("");
+
+    const num = (v: number | null | undefined, digits = 3) =>
+      typeof v === "number" && !Number.isNaN(v) ? v.toFixed(digits) : "—";
+
+    const signalsKeys: Array<keyof NonNullable<EvidenceItem["signals"]>> = [
+      "motion",
+      "audio_rms",
+      "scene_change",
+      "transcript_density",
+      "duration_sec",
+    ];
+
+    items.forEach((item, idx) => {
+      const title = item.bullet || `Shot ${item.shot_index ?? idx}`;
+      const mergedStart = typeof item.merged_start === "number" ? item.merged_start : null;
+      const mergedEnd = typeof item.merged_end === "number" ? item.merged_end : null;
+      const origStart = typeof item.orig_start === "number" ? item.orig_start : null;
+      const origEnd = typeof item.orig_end === "number" ? item.orig_end : null;
+
+      lines.push(`### ${idx + 1}. ${title}`);
+      lines.push(`shot_index: ${item.shot_index ?? "—"}`);
+      if (item.shot_id) lines.push(`shot_id: ${item.shot_id}`);
+      lines.push(`score: ${num(item.score, 6)}`);
+      lines.push(
+        `merged: ${mergedStart != null ? formatTime(mergedStart) : "—"} – ${mergedEnd != null ? formatTime(mergedEnd) : "—"} (sec: ${mergedStart ?? "—"} – ${mergedEnd ?? "—"})`
+      );
+      if (origStart != null || origEnd != null) {
+        lines.push(
+          `original: ${origStart != null ? formatTime(origStart) : "—"} – ${origEnd != null ? formatTime(origEnd) : "—"} (sec: ${origStart ?? "—"} – ${origEnd ?? "—"})`
+        );
+      }
+
+      const sig = item.signals || null;
+      if (sig) {
+        const sigParts = signalsKeys.map((k) => `${String(k)}=${num(sig[k] as number | null | undefined, 6)}`);
+        lines.push(`signals: ${sigParts.join(", ")}`);
+      } else {
+        lines.push("signals: —");
+      }
+
+      if (item.transcript_snippet) {
+        lines.push(`transcript_snippet: ${item.transcript_snippet.replace(/\s+/g, " ").trim()}`);
+      }
+
+      if (Array.isArray(item.neighbors) && item.neighbors.length > 0) {
+        lines.push("neighbors:");
+        item.neighbors.slice(0, 12).forEach((n) => {
+          lines.push(
+            `  - idx=${n.neighbor_index}, edge=${n.edge_type}, similarity=${num(n.similarity, 6)}, distance_sec=${num(n.distance_sec, 3)}`
+          );
+        });
+      }
+
+      lines.push("");
+    });
+
+    // TSV section for easy copy/paste graphing.
+    lines.push("---");
+    lines.push("Signals (TSV)");
+    lines.push("index\tstart_sec\tend_sec\tscore\tmotion\taudio_rms\tscene_change\ttranscript_density\tduration_sec");
+    items.forEach((item, idx) => {
+      const sig = item.signals || {};
+      const start = typeof item.merged_start === "number" ? item.merged_start : "";
+      const end = typeof item.merged_end === "number" ? item.merged_end : "";
+      const row = [
+        String(idx + 1),
+        String(start),
+        String(end),
+        typeof item.score === "number" ? String(item.score) : "",
+        typeof sig.motion === "number" ? String(sig.motion) : "",
+        typeof sig.audio_rms === "number" ? String(sig.audio_rms) : "",
+        typeof sig.scene_change === "number" ? String(sig.scene_change) : "",
+        typeof sig.transcript_density === "number" ? String(sig.transcript_density) : "",
+        typeof sig.duration_sec === "number" ? String(sig.duration_sec) : "",
+      ].join("\t");
+      lines.push(row);
+    });
+
+    return lines.join("\n");
+  };
+
+  const handleDownloadEvidenceText = () => {
+    if (!videoId) return;
+    if (!evidenceItems || evidenceItems.length === 0) return;
+    const content = formatEvidenceExport(evidenceItems);
+    const element = document.createElement("a");
+    const file = new Blob([content], { type: "text/plain" });
+    element.href = URL.createObjectURL(file);
+    element.download = `evidence_${videoId}.txt`;
+    document.body.appendChild(element);
+    element.click();
+    document.body.removeChild(element);
+  };
+
   const handleReadAloud = () => {
     if (!textSummary) return;
 
     if (isReading) {
-      window.speechSynthesis.cancel();
+      try {
+        if (audioRef.current) {
+          audioRef.current.pause();
+          audioRef.current.currentTime = 0;
+        }
+      } catch {}
       setIsReading(false);
       return;
     }
@@ -322,30 +698,42 @@ export default function DashboardPage() {
       .replace(/\s+/g, " ")
       .trim();
 
-    const utterance = new SpeechSynthesisUtterance(cleanText);
-    
-    // Apply selected voice
-    if (selectedVoice) {
-      utterance.voice = selectedVoice;
+    const voice = selectedTtsVoice || ttsVoices[0]?.short_name;
+    if (!voice) {
+      alert("No AI voices available (TTS backend may be missing)");
+      return;
     }
-    
-    // Improved voice parameters for more natural speech
-    utterance.rate = 0.95;  // Slightly slower for clarity
-    utterance.pitch = 1.0;  // Natural pitch
-    utterance.volume = 1.0;
 
-    utterance.onend = () => {
-      setIsReading(false);
-    };
-
-    utterance.onerror = () => {
-      setIsReading(false);
-      console.error("Speech synthesis error");
-    };
-
-    speechSynthesisRef.current = utterance;
     setIsReading(true);
-    window.speechSynthesis.speak(utterance);
+    axios
+      .post(`${API_BASE}/api/tts`, {
+        text: cleanText,
+        voice,
+        rate: ttsRate,
+        video_id: videoId || undefined
+      })
+      .then((resp) => {
+        const audioUrl = resp.data?.audio_url;
+        if (!audioUrl) throw new Error("No audio_url returned");
+
+        const fullUrl = `${API_BASE}${audioUrl}`;
+        const audio = new Audio(fullUrl);
+        audioRef.current = audio;
+        audio.onended = () => setIsReading(false);
+        audio.onerror = () => {
+          console.error("[TTS] Audio playback error");
+          setIsReading(false);
+        };
+        audio.play().catch((e) => {
+          console.error("[TTS] Play failed", e);
+          setIsReading(false);
+        });
+      })
+      .catch((e) => {
+        console.error("[TTS] Generation failed", e);
+        setIsReading(false);
+        alert("TTS failed (backend missing or network issue)");
+      });
   };
 
   const handleUpload = async () => {
@@ -446,6 +834,16 @@ export default function DashboardPage() {
     }
   };
 
+  const signalStats = getSignalStats();
+  const normSignal = (key: keyof NonNullable<EvidenceItem["signals"]>, v: number | null | undefined) => {
+    if (typeof v !== "number" || Number.isNaN(v)) return 0;
+    const s = signalStats[key as string] || { min: 0, max: 1 };
+    const denom = (s.max - s.min) || 1;
+    return Math.max(0, Math.min(1, (v - s.min) / denom));
+  };
+
+  const showSidePanel = showChaptersPanel || showEvidencePanel;
+
   return (
     <div className="h-screen bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950 p-4 flex flex-col overflow-hidden text-white" style={{ position: 'relative' }}>
       {/* Animated Background */}
@@ -497,14 +895,14 @@ export default function DashboardPage() {
                   <Button 
                     onClick={handleUpload}
                     disabled={!file || state.status === "processing"}
-                    className="w-full bg-gradient-to-r from-violet-600 via-pink-500 to-blue-600 hover:from-violet-700 hover:via-pink-600 hover:to-blue-700 text-white font-semibold transition-all"
+                    className="w-full bg-gradient-to-r from-slate-700 via-slate-600 to-slate-700 hover:from-slate-600 hover:via-slate-500 hover:to-slate-600 text-white font-semibold transition-all border border-white/10"
                   >
                     {state.status === "uploading" ? "Uploading..." : "Upload & Process"}
                   </Button>
                   <Button
                     onClick={handleReset}
                     disabled={state.status === "processing"}
-                    className="w-full bg-gradient-to-r from-pink-600 to-violet-600 hover:from-pink-700 hover:to-violet-700 text-white font-semibold transition-all"
+                    className="w-full bg-gradient-to-r from-slate-800 to-slate-700 hover:from-slate-700 hover:to-slate-600 text-white font-semibold transition-all border border-white/10"
                   >
                     Reset
                   </Button>
@@ -512,7 +910,7 @@ export default function DashboardPage() {
 
                 <Button
                   onClick={() => setShowHistory(true)}
-                  className="w-full flex items-center gap-2 bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-700 hover:to-blue-700 text-white font-semibold transition-all"
+                  className="w-full flex items-center gap-2 bg-gradient-to-r from-slate-800 via-slate-700 to-slate-800 hover:from-slate-700 hover:via-slate-600 hover:to-slate-700 text-white font-semibold transition-all border border-white/10"
                 >
                   <History className="w-4 h-4" />
                   History ({summaryHistory.length})
@@ -522,29 +920,51 @@ export default function DashboardPage() {
 
             {/* Status */}
             <Card className="bg-white/10 border-white/20 backdrop-blur-sm">
-              <CardHeader className="pb-2">
-                <CardTitle className="flex items-center gap-2 text-sm">
-                  {getStatusIcon()}
-                  <span className="capitalize">{state.status}</span>
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <p className="text-xs text-white">{state.currentStage}</p>
-                
-                <div>
-                  <div className="flex justify-between text-xs mb-1 text-white">
-                    <span>Progress</span>
-                    <span className="font-semibold">{state.progress}%</span>
+              <CardHeader className="py-3">
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2 text-sm text-white shrink-0 w-28">
+                    {getStatusIcon()}
+                    <span className="capitalize font-semibold text-white">
+                      {state.status === "idle"
+                        ? "Idle"
+                        : state.status === "uploading"
+                          ? "Uploading"
+                          : state.status === "processing"
+                            ? "Processing"
+                            : state.status === "completed"
+                              ? "Completed"
+                              : "Error"}
+                    </span>
                   </div>
-                  <Progress value={state.progress} className="h-2" />
+
+                  <div className="flex-1 h-3 rounded-full bg-white/10 overflow-hidden relative">
+                    <div
+                      className={`h-full rounded-full ${stageBarClass(state.currentStage)} transition-all duration-500 ease-out relative`}
+                      style={{ width: `${Math.max(0, Math.min(100, state.progress))}%` }}
+                    >
+                      <div className="absolute inset-0 opacity-30 animate-pulse bg-white/20" />
+                    </div>
+                    <div className="absolute inset-0 flex items-center justify-center px-2 pointer-events-none">
+                      <span
+                        className="text-[10px] font-semibold text-white/90 truncate"
+                        title={String(state.currentStage || "") || undefined}
+                      >
+                        {stageLabel(state.currentStage)} · {Math.max(0, Math.min(100, state.progress))}%
+                      </span>
+                    </div>
+                  </div>
+
+                  <span className="text-xs text-white font-semibold tabular-nums w-10 text-right shrink-0">
+                    {state.progress}%
+                  </span>
                 </div>
 
                 {state.error && (
-                  <div className="bg-red-900/30 border border-red-500/50 rounded p-2">
+                  <div className="mt-2 bg-red-900/30 border border-red-500/50 rounded p-2">
                     <p className="text-xs text-red-400">{state.error}</p>
                   </div>
                 )}
-              </CardContent>
+              </CardHeader>
             </Card>
 
             {/* Controls */}
@@ -553,11 +973,13 @@ export default function DashboardPage() {
                 {/* Text Length & Format - 2 Column Grid */}
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-2">
+                    <div className="text-center">
                     <GradientText
                     colors={['#6366f1', '#8b5cf6', '#a855f7', '#8b5cf6', '#6366f1']}
                     animationSpeed={4}
                   >Text Length
                   </GradientText>
+                    </div>
                     <div className="grid grid-cols-3 gap-1.5">
                       {(["short", "medium", "long"] as TextLength[]).map(len => (
                         <Button
@@ -578,11 +1000,13 @@ export default function DashboardPage() {
                   </div>
 
                   <div className="space-y-2">
+                    <div className="text-center">
                     <GradientText
                     colors={['#6366f1', '#8b5cf6', '#a855f7', '#8b5cf6', '#6366f1']}
                     animationSpeed={4}
                   >Format
                   </GradientText>
+                    </div>
                     <div className="grid grid-cols-3 gap-1.5">
                       {(["bullet", "structured", "plain"] as SummaryFormat[]).map(fmt => (
                         <Button
@@ -605,12 +1029,14 @@ export default function DashboardPage() {
 
                 {/* Content Type */}
                 <div>
+                  <div className="text-center">
                   <GradientText
                     colors={['#6366f1', '#8b5cf6', '#a855f7', '#8b5cf6', '#6366f1']}
                     animationSpeed={4}
                   >
                     Content Type
                   </GradientText>
+                  </div>
                   <div className="grid grid-cols-2 gap-2">
                     <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
                       summaryType === "balanced"
@@ -629,15 +1055,15 @@ export default function DashboardPage() {
                       <span>Balanced</span>
                     </label>
                     <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
-                      summaryType === "visual"
+                      summaryType === "visual_priority"
                         ? "bg-gradient-to-r from-pink-600 to-violet-600 text-white"
                         : "bg-gradient-to-r from-pink-500/20 to-violet-500/20 text-white hover:from-pink-500/40 hover:to-violet-500/40 border border-pink-500/30"
                     }`}>
                       <input 
                         type="radio"
                         name="summaryType"
-                        value="visual"
-                        checked={summaryType === "visual"}
+                        value="visual_priority"
+                        checked={summaryType === "visual_priority"}
                         onChange={(e) => setSummaryType(e.target.value as any)}
                         disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
                         className="accent-pink-400"
@@ -645,15 +1071,15 @@ export default function DashboardPage() {
                       <span>Visual Priority</span>
                     </label>
                     <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
-                      summaryType === "audio"
+                      summaryType === "audio_priority"
                         ? "bg-gradient-to-r from-blue-600 to-cyan-600 text-white"
                         : "bg-gradient-to-r from-blue-500/20 to-cyan-500/20 text-white hover:from-blue-500/40 hover:to-cyan-500/40 border border-blue-500/30"
                     }`}>
                       <input 
                         type="radio"
                         name="summaryType"
-                        value="audio"
-                        checked={summaryType === "audio"}
+                        value="audio_priority"
+                        checked={summaryType === "audio_priority"}
                         onChange={(e) => setSummaryType(e.target.value as any)}
                         disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
                         className="accent-blue-400"
@@ -661,15 +1087,15 @@ export default function DashboardPage() {
                       <span>Audio Priority</span>
                     </label>
                     <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
-                      summaryType === "highlight"
+                      summaryType === "highlights"
                         ? "bg-gradient-to-r from-violet-600 via-pink-600 to-blue-600 text-white"
                         : "bg-gradient-to-r from-violet-500/20 via-pink-500/20 to-blue-500/20 text-white hover:from-violet-500/40 hover:via-pink-500/40 hover:to-blue-500/40 border border-pink-500/30"
                     }`}>
                       <input 
                         type="radio"
                         name="summaryType"
-                        value="highlight"
-                        checked={summaryType === "highlight"}
+                        value="highlights"
+                        checked={summaryType === "highlights"}
                         onChange={(e) => setSummaryType(e.target.value as any)}
                         disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
                         className="accent-pink-400"
@@ -678,72 +1104,119 @@ export default function DashboardPage() {
                     </label>
                   </div>
                 </div>
+
+                {/* Panels */}
+                <div>
+                  <div className="text-center">
+                  <GradientText
+                    colors={['#6366f1', '#8b5cf6', '#a855f7', '#8b5cf6', '#6366f1']}
+                    animationSpeed={4}
+                  >
+                    Panels
+                  </GradientText>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 mt-2">
+                    <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
+                      showChaptersPanel
+                        ? "bg-gradient-to-r from-emerald-600/60 to-cyan-600/60 text-white border border-emerald-400/40"
+                        : "bg-white/5 text-white hover:bg-white/10 border border-white/10"
+                    }`}>
+                      <input
+                        type="checkbox"
+                        checked={showChaptersPanel}
+                        onChange={(e) => setShowChaptersPanel(e.target.checked)}
+                        className="accent-emerald-400"
+                      />
+                      <span>Chapters</span>
+                    </label>
+                    <label className={`flex items-center gap-2 cursor-pointer px-3 py-2 rounded-md transition-all font-medium text-xs ${
+                      showEvidencePanel
+                        ? "bg-gradient-to-r from-amber-600/60 to-red-600/60 text-white border border-amber-400/40"
+                        : "bg-white/5 text-white hover:bg-white/10 border border-white/10"
+                    }`}>
+                      <input
+                        type="checkbox"
+                        checked={showEvidencePanel}
+                        onChange={(e) => setShowEvidencePanel(e.target.checked)}
+                        className="accent-amber-400"
+                      />
+                      <span>Evidence</span>
+                    </label>
+                  </div>
+                </div>
               </CardContent>
             </Card>
           </div>
 
           {/* Right: Output - 2/3 width */}
-          <div className="col-span-2 flex flex-col gap-4 overflow-hidden">
+          <div className="col-span-2 overflow-hidden h-full flex flex-col">
             {state.status === "completed" || textSummary ? (
-              <>
-                {/* Merged Video Player - Top Section */}
-                {state.videoUrl && (
-                  <Card className="flex-1 bg-white/10 border-white/20 backdrop-blur-sm flex flex-col min-h-[45%]">
-                    <CardHeader className="pb-2">
-                      <CardTitle className="text-base">
-                        <GradientText
-                          colors={['#ec4899', '#f97316', '#ec4899', '#f97316', '#ec4899']}
-                          animationSpeed={4}
+              <div className={`h-full grid gap-4 overflow-hidden ${showSidePanel ? "grid-cols-2" : "grid-cols-1"}`}>
+                {/* Left: Intended summary output */}
+                <div className="flex flex-col gap-4 overflow-hidden">
+                  {/* Merged Video Player */}
+                  {state.videoUrl && (
+                    <Card className="bg-white/10 border-white/20 backdrop-blur-sm flex flex-col min-h-[45%]">
+                      <CardHeader className="pb-2">
+                        <CardTitle className="text-base text-center">
+                          <GradientText
+                            colors={['#ec4899', '#f97316', '#ec4899', '#f97316', '#ec4899']}
+                            animationSpeed={4}
+                          >
+                            Important Shots Compilation
+                          </GradientText>
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent className="flex-1 flex items-center justify-center overflow-hidden relative">
+                        <video
+                          key={state.videoUrl}
+                          ref={videoRef}
+                          controls
+                          preload="metadata"
+                          playsInline
+                          className="w-full h-full object-contain rounded-lg"
+                          style={{ maxHeight: "100%" }}
+                          onError={(e) => {
+                            console.error("[Video] Failed to load:", state.videoUrl);
+                            console.error("[Video] Error details:", e);
+                          }}
+                          onLoadedMetadata={() => {
+                            console.log("[Video] Loaded successfully:", state.videoUrl);
+                          }}
                         >
-                          Important Shots Compilation
-                        </GradientText>
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="flex-1 flex items-center justify-center overflow-hidden relative">
-                      <video
-                        key={state.videoUrl}
-                        controls
-                        preload="metadata"
-                        playsInline
-                        className="w-full h-full object-contain rounded-lg"
-                        style={{ maxHeight: "100%" }}
-                        onError={(e) => {
-                          console.error("[Video] Failed to load:", state.videoUrl);
-                          console.error("[Video] Error details:", e);
-                        }}
-                        onLoadedMetadata={() => {
-                          console.log("[Video] Loaded successfully:", state.videoUrl);
-                        }}
-                      >
-                        <source src={`${state.videoUrl}?t=${Date.now()}`} type="video/mp4" />
-                        Your browser does not support the video tag.
-                      </video>
-                      
+                          <source src={`${state.videoUrl}?t=${Date.now()}`} type="video/mp4" />
+                          Your browser does not support the video tag.
+                        </video>
+                      </CardContent>
+                    </Card>
+                  )}
 
-                    </CardContent>
-                  </Card>
-                )}
-
-                {/* Text Summary - Bottom Section */}
-                {textSummary && (
-                  <Card className={`${state.videoUrl ? 'flex-1 min-h-[50%]' : 'flex-1'} bg-white/10 border-white/20 backdrop-blur-sm flex flex-col overflow-hidden`}>
-                    <CardHeader className="pb-3">
-                      <CardTitle className="text-base">
-                        <GradientText
-                          colors={['#10b981', '#06b6d4', '#3b82f6', '#06b6d4', '#10b981']}
-                          animationSpeed={4}
-                        >
-                          Text Summary ({processingConfig?.format || summaryFormat} • {processingConfig?.length || textLength})
-                        </GradientText>
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent className="flex-1 overflow-y-auto mb-4">
-                      <div className="bg-white/5 rounded-lg p-4 prose prose-sm max-w-none">
-                        <pre className="whitespace-pre-wrap font-sans text-sm text-white">
-                          {textSummary}
-                        </pre>
-                      </div>
-                    </CardContent>
+                  {/* Text Summary */}
+                  {textSummary && (
+                    <Card className={`${state.videoUrl ? 'flex-1 min-h-[50%]' : 'flex-1'} bg-white/10 border-white/20 backdrop-blur-sm flex flex-col overflow-hidden`}>
+                      <CardHeader className="pb-3">
+                        <CardTitle className="text-base text-center">
+                          <GradientText
+                            colors={['#10b981', '#06b6d4', '#3b82f6', '#06b6d4', '#10b981']}
+                            animationSpeed={4}
+                          >
+                            Text Summary ({processingConfig?.format || summaryFormat} • {processingConfig?.length || textLength})
+                          </GradientText>
+                        </CardTitle>
+                        {typeof state.processingDurationSec === "number" && (
+                          <div className="mt-1 flex items-center gap-2 text-xs text-slate-300">
+                            <Clock className="w-3 h-3" />
+                            <span>Processed in {formatTime(state.processingDurationSec)}</span>
+                          </div>
+                        )}
+                      </CardHeader>
+                      <CardContent className="flex-1 overflow-y-auto mb-4">
+                        <div className="bg-white/5 rounded-lg p-4 prose prose-sm max-w-none">
+                          <pre className="whitespace-pre-wrap font-sans text-sm text-white">
+                            {textSummary}
+                          </pre>
+                        </div>
+                      </CardContent>
                     
                     {/* Action Buttons - Compact Layout */}
                     <div className="px-6 pb-4 border-t border-white/10 pt-4">
@@ -751,7 +1224,7 @@ export default function DashboardPage() {
                         {/* Download TXT Button */}
                         <Button
                           onClick={handleDownloadText}
-                          className="flex items-center justify-center gap-1 bg-gradient-to-r from-violet-600 to-blue-600 hover:from-violet-700 hover:to-blue-700 text-white font-semibold transition-all text-xs py-2"
+                          className="flex items-center justify-center gap-1 bg-gradient-to-r from-slate-800 to-slate-700 hover:from-slate-700 hover:to-slate-600 text-white font-semibold transition-all text-xs py-2 border border-white/10"
                           title="Download as TXT"
                         >
                           <Download className="w-3 h-3" />
@@ -761,34 +1234,40 @@ export default function DashboardPage() {
                         {/* Download JSON Button */}
                         <Button
                           onClick={handleDownloadJSON}
-                          className="flex items-center justify-center gap-1 bg-gradient-to-r from-pink-600 to-violet-600 hover:from-pink-700 hover:to-violet-700 text-white font-semibold transition-all text-xs py-2"
+                          className="flex items-center justify-center gap-1 bg-gradient-to-r from-slate-800 to-slate-700 hover:from-slate-700 hover:to-slate-600 text-white font-semibold transition-all text-xs py-2 border border-white/10"
                           title="Download as JSON"
                         >
                           <Download className="w-3 h-3" />
                           JSON
                         </Button>
 
-                        {/* Voice Selection Dropdown */}
-                        {availableVoices.length > 0 && (
-                          <div className="col-span-2">
+                        {/* AI Voice + Speed (backend TTS) */}
+                        {ttsVoices.length > 0 && (
+                          <div className="col-span-2 grid grid-cols-2 gap-2">
                             <select
-                              value={selectedVoice?.name || ''}
-                              onChange={(e) => {
-                                const voice = availableVoices.find(v => v.name === e.target.value);
-                                setSelectedVoice(voice || null);
-                              }}
+                              value={selectedTtsVoice || ttsVoices[0]?.short_name || ""}
+                              onChange={(e) => setSelectedTtsVoice(e.target.value)}
                               className="w-full bg-white/10 border border-white/20 rounded-lg px-2 py-2 text-xs text-white focus:outline-none focus:border-violet-500 transition-colors"
-                              title="Select voice for text-to-speech"
+                              title="Select AI voice"
                             >
-                              {availableVoices.map((voice) => (
-                                  <option 
-                                    key={voice.name} 
-                                    value={voice.name}
-                                    className="bg-gray-900 text-white"
-                                  >
-                                    {voice.name} {voice.localService ? '🌐' : '☁️'}
-                                  </option>
-                                ))}
+                              {ttsVoices.map((v) => (
+                                <option key={v.short_name} value={v.short_name} className="bg-gray-900 text-white">
+                                  {(v.friendly_name || v.short_name) + (v.locale ? ` (${v.locale})` : "")}
+                                </option>
+                              ))}
+                            </select>
+
+                            <select
+                              value={String(ttsRate)}
+                              onChange={(e) => setTtsRate(Number(e.target.value))}
+                              className="w-full bg-white/10 border border-white/20 rounded-lg px-2 py-2 text-xs text-white focus:outline-none focus:border-violet-500 transition-colors"
+                              title="Speaking speed"
+                            >
+                              <option value="0.75" className="bg-gray-900 text-white">0.75×</option>
+                              <option value="0.9" className="bg-gray-900 text-white">0.9×</option>
+                              <option value="1" className="bg-gray-900 text-white">1.0×</option>
+                              <option value="1.1" className="bg-gray-900 text-white">1.1×</option>
+                              <option value="1.25" className="bg-gray-900 text-white">1.25×</option>
                             </select>
                           </div>
                         )}
@@ -799,7 +1278,7 @@ export default function DashboardPage() {
                           className={`flex items-center justify-center gap-1 py-2 font-semibold transition-all duration-200 text-xs ${
                             isReading
                               ? "bg-gradient-to-r from-red-600 to-pink-600 hover:from-red-700 hover:to-pink-700"
-                              : "bg-gradient-to-r from-violet-600 via-pink-500 to-blue-600 hover:from-violet-700 hover:via-pink-600 hover:to-blue-700"
+                              : "bg-gradient-to-r from-slate-700 via-slate-600 to-slate-700 hover:from-slate-600 hover:via-slate-500 hover:to-slate-600"
                           } text-white`}
                           title={isReading ? "Stop reading" : "Read aloud with text-to-speech"}
                         >
@@ -824,9 +1303,211 @@ export default function DashboardPage() {
                         </div>
                       )}
                     </div>
-                  </Card>
+                    </Card>
+                  )}
+                </div>
+
+                {/* Right: Chapters + evidence side panel */}
+                {showSidePanel && (
+                  <div className="flex flex-col gap-4 overflow-hidden">
+                    {/* Chapters (YouTube-style TOC) */}
+                    {showChaptersPanel && state.videoUrl && chapters.length > 0 && (
+                      <Card className="bg-white/10 border-white/20 backdrop-blur-sm">
+                        <CardHeader className="pb-2">
+                          <CardTitle className="text-base text-center">
+                            <GradientText
+                              colors={['#22c55e', '#06b6d4', '#22c55e', '#06b6d4', '#22c55e']}
+                              animationSpeed={4}
+                            >
+                              Chapters
+                            </GradientText>
+                          </CardTitle>
+                        </CardHeader>
+                        <CardContent className="space-y-2 overflow-y-auto max-h-[35vh]">
+                          {chapters.map((ch) => (
+                            <button
+                              key={`ch_${ch.index}`}
+                              type="button"
+                              onClick={() => {
+                                const el = videoRef.current;
+                                if (!el) return;
+                                el.currentTime = ch.merged_start;
+                                el.play().catch(() => undefined);
+                                el.scrollIntoView({ behavior: "smooth", block: "center" });
+                              }}
+                              className="w-full text-left flex items-center justify-between gap-3 p-3 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 transition-all"
+                              title={`Jump to ${formatTime(ch.merged_start)}`}
+                            >
+                              <div className="min-w-0">
+                                <p className="text-sm text-white font-semibold truncate" title={String(ch.title || "") || undefined}>
+                                  {formatChapterTitle(ch.title, ch.index)}
+                                </p>
+                                <p className="text-xs text-slate-300">{formatTime(ch.merged_start)} – {formatTime(ch.merged_end)}</p>
+                              </div>
+                              <span className="text-xs text-slate-300 shrink-0">Chapter {ch.index + 1}</span>
+                            </button>
+                          ))}
+                        </CardContent>
+                      </Card>
+                    )}
+
+                    {/* Evidence-linked Highlights */}
+                    {showEvidencePanel && state.videoUrl && evidenceItems.length > 0 && (
+                      <Card className="bg-white/10 border-white/20 backdrop-blur-sm flex flex-col flex-1 min-h-0 overflow-hidden">
+                        <CardHeader className="pb-2">
+                          <CardTitle className="text-base flex items-center justify-center gap-2">
+                            <GradientText
+                              colors={['#f59e0b', '#ef4444', '#f59e0b', '#ef4444', '#f59e0b']}
+                              animationSpeed={4}
+                            >
+                              Evidence-linked Highlights
+                            </GradientText>
+                            <Button
+                              onClick={handleDownloadEvidenceText}
+                              className="flex items-center justify-center gap-1 bg-gradient-to-r from-slate-800 to-slate-700 hover:from-slate-700 hover:to-slate-600 text-white font-semibold transition-all text-xs py-1.5 px-2 border border-white/10"
+                              title="Download evidence as text"
+                            >
+                              <Download className="w-3 h-3" />
+                              TXT
+                            </Button>
+                          </CardTitle>
+                        </CardHeader>
+                        <CardContent className="flex-1 min-h-0 min-w-0 space-y-2 overflow-y-auto overflow-x-hidden overscroll-contain pr-1">
+                          {evidenceItems.map((item: EvidenceItem, idx: number) => {
+                            const canSeek = typeof item.merged_start === "number" && item.merged_start >= 0;
+                            const thumbSrc = item.thumbnail_url ? `${API_BASE}${item.thumbnail_url}` : null;
+                            const evKey = String(item.shot_id || item.shot_index || idx);
+                            const expanded = expandedEvidenceKey === evKey;
+                            return (
+                              <div
+                                key={`${item.shot_id || item.shot_index || idx}`}
+                                className={`w-full text-left p-3 rounded-lg border transition-all overflow-hidden ${
+                                  canSeek
+                                    ? "bg-white/5 border-white/10"
+                                    : "bg-white/5 border-white/5 opacity-60"
+                                }`}
+                              >
+                                <div className="flex gap-3 min-w-0">
+                                  <button
+                                    type="button"
+                                    disabled={!canSeek}
+                                    onClick={() => {
+                                      if (!canSeek) return;
+                                      const el = videoRef.current;
+                                      if (!el) return;
+                                      el.currentTime = item.merged_start as number;
+                                      el.play().catch(() => undefined);
+                                      el.scrollIntoView({ behavior: "smooth", block: "center" });
+                                    }}
+                                    className={`flex-1 text-left flex gap-3 rounded-lg transition-all ${
+                                      canSeek ? "hover:bg-white/5" : "cursor-not-allowed"
+                                    }`}
+                                    title={canSeek ? `Jump to ${formatTime(item.merged_start)}` : "No merged timestamp available"}
+                                  >
+                                    <div className="w-24 h-14 rounded-md overflow-hidden bg-black/40 shrink-0 flex items-center justify-center">
+                                      {thumbSrc ? (
+                                        <img
+                                          src={thumbSrc}
+                                          alt={`Shot ${item.shot_index ?? ""}`}
+                                          className="w-full h-full object-cover"
+                                          loading="lazy"
+                                          onError={(e) => {
+                                            (e.currentTarget as HTMLImageElement).style.display = "none";
+                                          }}
+                                        />
+                                      ) : (
+                                        <span className="text-xs text-slate-300">No thumbnail</span>
+                                      )}
+                                    </div>
+
+                                    <div className="min-w-0 flex-1 overflow-hidden">
+                                      <div className="flex items-center justify-between gap-2">
+                                        <p className="text-sm text-white font-medium truncate">
+                                          {item.bullet || `Shot ${item.shot_index ?? idx}`}
+                                        </p>
+                                        <span className="text-xs text-slate-300 shrink-0">
+                                          {formatTime(item.merged_start)}
+                                        </span>
+                                      </div>
+                                      <div className="flex items-center justify-between mt-1">
+                                        <p className="text-xs text-slate-300">
+                                          Importance: {typeof item.score === "number" ? item.score.toFixed(3) : "—"}
+                                        </p>
+                                      </div>
+                                      {item.transcript_snippet && (
+                                        <p className="text-xs text-slate-300 mt-1 line-clamp-2 break-all whitespace-normal">
+                                          {item.transcript_snippet}
+                                        </p>
+                                      )}
+                                    </div>
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedEvidenceKey(prev => (prev === evKey ? null : evKey))}
+                                    className="text-xs text-emerald-300 hover:text-emerald-200 font-semibold flex items-center gap-1 shrink-0 px-2"
+                                    title="Why this shot was selected"
+                                  >
+                                    Why
+                                    {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                                  </button>
+                                </div>
+
+                                {expanded && (
+                                  <div className="mt-3 pt-3 border-t border-white/10 grid grid-cols-2 gap-3 overflow-hidden min-w-0">
+                                    <div className="space-y-2 min-w-0">
+                                      <p className="text-xs text-white font-semibold">Top contributing signals</p>
+
+                                      {([
+                                        ["motion", item.signals?.motion],
+                                        ["audio_rms", item.signals?.audio_rms],
+                                        ["scene_change", item.signals?.scene_change],
+                                        ["transcript_density", item.signals?.transcript_density],
+                                      ] as Array<[keyof NonNullable<EvidenceItem["signals"]>, number | null | undefined]>).map(([k, v]) => (
+                                        <div key={String(k)} className="space-y-1">
+                                          <div className="flex justify-between text-xs text-slate-300">
+                                            <span className="capitalize">{String(k).replace("_", " ")}</span>
+                                            <span>{typeof v === "number" ? v.toFixed(3) : "—"}</span>
+                                          </div>
+                                          <Progress value={Math.round(normSignal(k, v) * 100)} className="h-2" />
+                                        </div>
+                                      ))}
+
+                                      {typeof item.signals?.duration_sec === "number" && (
+                                        <p className="text-xs text-slate-400">Shot duration: {item.signals.duration_sec.toFixed(2)}s</p>
+                                      )}
+                                    </div>
+
+                                    <div className="space-y-2 min-w-0">
+                                      <p className="text-xs text-white font-semibold">Graph neighbors</p>
+                                      {item.neighbors && item.neighbors.length > 0 ? (
+                                        <div className="space-y-1">
+                                          {item.neighbors.slice(0, 8).map((n: NonNullable<EvidenceItem["neighbors"]>[number]) => (
+                                            <div key={`${evKey}_${n.neighbor_index}_${n.edge_type}`} className="text-xs text-slate-300 flex items-center justify-between gap-2 min-w-0">
+                                              <span className="min-w-0 flex-1 truncate">Shot {n.neighbor_index} ({n.edge_type})</span>
+                                              <span className="shrink-0">
+                                                {n.edge_type === "semantic"
+                                                  ? `sim ${(n.similarity ?? 0).toFixed(2)}`
+                                                  : `${Math.round(n.distance_sec ?? 0)}s`}
+                                              </span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      ) : (
+                                        <p className="text-xs text-slate-400">No neighbor info</p>
+                                      )}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </CardContent>
+                      </Card>
+                    )}
+                  </div>
                 )}
-              </>
+              </div>
             ) : (
               <Card className="flex-1 flex items-center justify-center bg-white/10 border-white/20 backdrop-blur-sm">
                 <CardContent>
@@ -849,7 +1530,7 @@ export default function DashboardPage() {
               onClick={() => setLogsExpanded(!logsExpanded)}
             >
               <CardTitle className="flex items-center justify-between text-sm">
-                <span>
+                <span className="flex-1 text-center">
                   <GradientText
                     colors={['#f59e0b', '#f97316', '#ef4444', '#f97316', '#f59e0b']}
                     animationSpeed={4}
@@ -897,7 +1578,7 @@ export default function DashboardPage() {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
           <Card className="w-full max-w-2xl max-h-[80vh] bg-slate-950 border-white/20 backdrop-blur-sm flex flex-col">
             <CardHeader className="flex items-center justify-between border-b border-white/10 pb-3">
-              <CardTitle className="flex items-center gap-2 text-lg">
+              <CardTitle className="flex items-center gap-2 text-lg w-full justify-center text-center">
                 <History className="w-5 h-5 text-cyan-400" />
                 <GradientText
                   colors={['#06b6d4', '#0ea5e9', '#06b6d4', '#0ea5e9', '#06b6d4']}

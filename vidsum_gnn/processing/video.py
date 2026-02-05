@@ -3,7 +3,7 @@ import json
 import subprocess
 import asyncio
 import gc
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Union
 from vidsum_gnn.core.config import settings
 from vidsum_gnn.utils import get_logger, PipelineStage
 
@@ -199,8 +199,9 @@ async def merge_important_shots(
     importance_scores: List[float],
     threshold: float = 0.5,
     output_path: str = None,
-    max_duration: int = 600
-) -> str:
+    max_duration: int = 600,
+    return_manifest: bool = False,
+) -> Union[str, Tuple[str, List[Dict[str, Any]]]]:
     """
     Create a merged video containing only the important shots.
     
@@ -218,11 +219,11 @@ async def merge_important_shots(
     logger = get_logger(__name__)
     logger.info(f"Merging important shots (threshold={threshold})")
     
-    # Filter shots by importance
-    important_shots = [
-        (shots_times[i], importance_scores[i])
+    # Filter shots by importance (keep original index for downstream mapping)
+    important_shots: List[Tuple[int, Tuple[float, float], float]] = [
+        (i, shots_times[i], float(importance_scores[i]))
         for i in range(len(shots_times))
-        if i < len(importance_scores) and importance_scores[i] >= threshold
+        if i < len(importance_scores) and float(importance_scores[i]) >= threshold
     ]
     
     if not important_shots:
@@ -230,8 +231,8 @@ async def merge_important_shots(
         num_fallback = max(10, min(50, len(shots_times) // 5))
         logger.warning(f"No shots met threshold {threshold}, using top {num_fallback} shots")
         sorted_shots = sorted(
-            zip(shots_times, importance_scores),
-            key=lambda x: x[1],
+            [(i, shots_times[i], float(importance_scores[i])) for i in range(min(len(shots_times), len(importance_scores)))],
+            key=lambda x: x[2],
             reverse=True
         )
         important_shots = sorted_shots[:num_fallback]
@@ -247,7 +248,7 @@ async def merge_important_shots(
     
     try:
         # Calculate total duration of important shots
-        total_duration = sum(end - start for (start, end), _ in important_shots)
+        total_duration = sum(end - start for _, (start, end), _ in important_shots)
         
         # If total duration exceeds max, sample shots to reduce it
         if total_duration > max_duration:
@@ -255,21 +256,35 @@ async def merge_important_shots(
             # Keep only top shots until we reach max_duration
             sampled_shots = []
             current_duration = 0
-            for shot, score in sorted(important_shots, key=lambda x: x[1], reverse=True):
+            for idx, shot, score in sorted(important_shots, key=lambda x: x[2], reverse=True):
                 shot_duration = shot[1] - shot[0]
                 if current_duration + shot_duration <= max_duration:
-                    sampled_shots.append((shot, score))
+                    sampled_shots.append((idx, shot, score))
                     current_duration += shot_duration
             
-            important_shots = sorted(sampled_shots, key=lambda x: x[0][0])  # Re-sort by time
+            important_shots = sorted(sampled_shots, key=lambda x: x[1][0])  # Re-sort by time
             total_duration = current_duration
         
         logger.info(f"Creating merged video with {len(important_shots)} shots ({total_duration:.1f}s total)")
+
+        manifest: List[Dict[str, Any]] = []
+        merged_cursor = 0.0
         
         # Extract individual segments with video+audio
         segments = []
-        for i, ((start, end), score) in enumerate(important_shots):
+        for i, (shot_index, (start, end), score) in enumerate(important_shots):
             segment_path = output_path.replace('.mp4', f'_seg_{i:03d}.mp4')
+            duration = float(end - start)
+            manifest.append({
+                "segment_index": i,
+                "shot_index": int(shot_index),
+                "orig_start": float(start),
+                "orig_end": float(end),
+                "merged_start": float(merged_cursor),
+                "merged_end": float(merged_cursor + duration),
+                "score": float(score),
+            })
+            merged_cursor += duration
             
             seg_cmd = [
                 "ffmpeg",
@@ -365,7 +380,7 @@ async def merge_important_shots(
         if os.path.exists(output_path):
             file_size = os.path.getsize(output_path) / (1024*1024)
             logger.info(f"✓ Merged video created: {output_path} ({file_size:.1f}MB)")
-            return output_path
+            return (output_path, manifest) if return_manifest else output_path
         else:
             raise RuntimeError(f"Output file not created: {output_path}")
         

@@ -118,17 +118,36 @@ class InferenceService:
         Returns:
             Formatted summary string
         """
-        # Step 1: Transcribe audio
+        all_summaries = self.generate_text_summaries_all_formats(
+            audio_paths=audio_paths,
+            gnn_scores=gnn_scores,
+            summary_type=summary_type,
+            text_length=text_length,
+            cache_dir=cache_dir
+        )
+        return all_summaries.get(summary_format) or all_summaries.get("bullet") or ""
+
+    def generate_text_summaries_all_formats(
+        self,
+        audio_paths: List[Path],
+        gnn_scores: List[float],
+        summary_type: str = "balanced",
+        text_length: str = "medium",
+        cache_dir: Optional[Path] = None,
+    ) -> Dict[str, str]:
+        """Generate bullet/structured/plain summaries for the same video.
+
+        Optimized to do transcription once and model generation once.
+        """
         logger.info(f"Transcribing {len(audio_paths)} audio files")
         transcriber = self.manager.get_whisper()
-        transcripts = []
-        
+        transcripts: List[str] = []
+
         for audio_path in audio_paths:
             audio_path_obj = Path(audio_path) if isinstance(audio_path, str) else audio_path
             if audio_path_obj.exists():
                 try:
                     transcript = transcriber.transcribe(audio_path_obj, cache_dir)
-                    # Filter out empty or garbage transcriptions
                     if transcript and len(transcript.strip()) > 3:
                         transcripts.append(transcript.strip())
                     else:
@@ -138,36 +157,31 @@ class InferenceService:
                     transcripts.append("")
             else:
                 transcripts.append("")
-        
+
         valid_transcripts = sum(1 for t in transcripts if t)
         logger.info(f"Transcription complete ({valid_transcripts}/{len(transcripts)} valid)")
-        
-        # If too few valid transcriptions, warn user
         if valid_transcripts == 0:
             logger.warning("No valid transcriptions found - video may contain only music/noise")
-            return "⚠️ No speech detected in video - unable to generate summary"
-        
-        # Optional: compute fused features for downstream use/logging
+            fallback = "⚠️ No speech detected in video - unable to generate summary"
+            return {"bullet": fallback, "structured": fallback, "plain": fallback}
+
         _fused = self.fuse_hidden_with_text(transcripts)
-        
-        # Step 2: Generate summary
-        logger.info(f"Generating {text_length} {summary_format} summary")
+
         summarizer = self.manager.get_summarizer()
-        # Compute top-k from ratio
         n = len(gnn_scores)
         k_ratio = max(0.0, min(1.0, float(getattr(settings, "TOPK_RATIO", 0.15))))
         top_k = max(1, int(np.ceil(k_ratio * n))) if n > 0 else 1
-        summary = summarizer.summarize(
+
+        logger.info(f"Generating {text_length} summaries in all formats")
+        summaries = summarizer.summarize_all_formats(
             transcripts=transcripts,
             gnn_scores=gnn_scores,
             summary_type=summary_type,
             text_length=text_length,
-            summary_format=summary_format,
             top_k=top_k
         )
-        
         logger.info("Summary generation complete")
-        return summary
+        return summaries
     
     def process_video_pipeline(
         self,

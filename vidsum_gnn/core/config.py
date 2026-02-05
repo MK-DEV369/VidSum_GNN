@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # ASR (Whisper)
+    # - "auto": let Whisper detect the spoken language
+    # - ISO language codes like "en", "es", "hi", ... to force a specific language
+    WHISPER_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "auto")
+
     # Storage
     UPLOAD_DIR: str = os.path.join(os.getcwd(), "data", "uploads")
     PROCESSED_DIR: str = os.path.join(os.getcwd(), "data", "processed")

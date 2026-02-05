@@ -41,6 +41,10 @@ scikit-learn>=1.3.0
 tqdm>=4.66.0
 requests>=2.31.0
 
+# Backend TTS (non-browser Read Aloud)
+edge-tts>=6.1.12
+gTTS>=2.5.1
+
 # Gemini API Fallback (optional, requires GEMINI_API_KEY environment variable)
 google-genai>=0.3.0
 

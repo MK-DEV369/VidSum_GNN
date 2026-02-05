@@ -24,39 +24,39 @@ export default function HomePage() {
     {
       icon: <GitGraph className="w-10 h-10 text-white" />,
       title: "Graph Attention Networks",
-      description: "Advanced GNN architecture analyzes complex relationships between video scenes using temporal, semantic, and audio edges for intelligent importance scoring."
+      description: "GAT-based scoring over a shot graph (temporal + semantic + audio signals) to rank important scenes for the final compilation and summary."
     },
     {
       icon: <Brain className="w-10 h-10 text-white" />,
-      title: "Multimodal Deep Learning",
-      description: "Integrates Vision Transformers (ViT), HuBert audio processing (Wav2Vec2), and temporal analysis for comprehensive multimodal scene understanding."
+      title: "Multimodal Understanding",
+      description: "Combines visual embeddings (ViT), audio-to-text transcription (Whisper), and temporal signals for stronger scene understanding and better summaries."
     },
     {
       icon: <Zap className="w-10 h-10 text-white" />,
-      title: "Enterprise-Scale Processing",
-      description: "Handles long-form videos with intelligent chunking, automatic memory management, GPU acceleration, and real-time progress tracking."
+      title: "Real-time Dashboard",
+      description: "Live progress updates via WebSocket logs with a compact status bar, plus downloads, history, and a merged 'important shots' video preview."
     },
     {
       icon: <Scissors className="w-10 h-10 text-white" />,
-      title: "Smart Summary Generation",
-      description: "Flexible Content Types (Balanced/Visual/Audio/Highlights) for generating summaries with customizable length, format (bullet/structured/plain), and content priority."
+      title: "Highlights, Chapters & Read Aloud",
+      description: "Evidence-linked highlights and YouTube-style chapters, plus backend TTS with multi-voice support (Edge neural voices when available and free Google TTS presets)."
     }
   ];
 
   const workflow = [
-    { step: 1, icon: <Upload className="w-6 h-6 text-white" />, label: "Upload & Transcode", desc: "Process video file" },
-    { step: 2, icon: <Video className="w-6 h-6 text-white" />, label: "Scene Detection", desc: "Identify shot boundaries" },
-    { step: 3, icon: <Brain className="w-6 h-6 text-white" />, label: "Feature Extraction", desc: "ViT + Wav2Vec2 analysis" },
-    { step: 4, icon: <GitGraph className="w-6 h-6 text-white" />, label: "Graph Construction", desc: "Build temporal-semantic graph" },
-    { step: 5, icon: <Zap className="w-6 h-6 text-white" />, label: "GNN Inference", desc: "GAT importance scoring" },
-    { step: 6, icon: <Play className="w-6 h-6 text-white" />, label: "Summary Generation", desc: "Assemble & export" }
+    { step: 1, icon: <Upload className="w-6 h-6 text-white" />, label: "Upload & Prepare", desc: "Validate + transcode" },
+    { step: 2, icon: <Video className="w-6 h-6 text-white" />, label: "Shot Detection", desc: "Find scene boundaries" },
+    { step: 3, icon: <Brain className="w-6 h-6 text-white" />, label: "Feature Extraction", desc: "Visual + audio signals" },
+    { step: 4, icon: <GitGraph className="w-6 h-6 text-white" />, label: "Graph Scoring", desc: "GAT importance ranking" },
+    { step: 5, icon: <Zap className="w-6 h-6 text-white" />, label: "Important Shots", desc: "Merge top segments" },
+    { step: 6, icon: <Play className="w-6 h-6 text-white" />, label: "Summary & Insights", desc: "Summary + chapters + evidence" }
   ];
 
   const techStack = [
     { category: "Frontend", items: ["React 18", "TypeScript", "Vite 5", "TailwindCSS", "shadcn/ui", "WebSocket"] },
-    { category: "Backend", items: ["FastAPI", "PyTorch 2.1", "PyTorch Geometric", "SQLAlchemy", "Asyncio"] },
-    { category: "AI Models", items: ["ViT-B/16", "HuBert-Base", "GAT", "Scene Detection", "FLAN-T5"] },
-    { category: "Infrastructure", items: ["Docker", "PostgreSQL", "FFmpeg", "SceneDetect", "CUDA"] }
+    { category: "Backend", items: ["FastAPI", "SQLAlchemy (async)", "TimescaleDB/PostgreSQL", "PyTorch", "PyTorch Geometric", "edge-tts", "gTTS"] },
+    { category: "AI Models", items: ["ViT-B/16", "Whisper (ASR)", "GAT", "Scene Detection", "FLAN-T5"] },
+    { category: "Infrastructure", items: ["Docker", "TimescaleDB", "FFmpeg", "SceneDetect", "CUDA"] }
   ];
 
   return (

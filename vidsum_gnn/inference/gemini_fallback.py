@@ -76,11 +76,14 @@ class GeminiVideoSummarizer:
             with open(video_path, "rb") as f:
                 video_bytes = f.read()
             
-            # Determine prompt based on summary type
+            # Determine prompt based on summary type (support legacy + current vocab)
             prompt_map = {
                 "visual": "Focus on visual elements, scene changes, and visual effects. Provide a summary emphasizing what viewers see.",
+                "visual_priority": "Focus on visual elements, scene changes, and visual effects. Provide a summary emphasizing what viewers see.",
                 "audio": "Focus on dialogue, narration, and sound. Provide a summary emphasizing what viewers hear.",
+                "audio_priority": "Focus on dialogue, narration, and sound. Provide a summary emphasizing what viewers hear.",
                 "highlight": "Identify and summarize the most important/exciting moments in the video.",
+                "highlights": "Identify and summarize the most important/exciting moments in the video.",
                 "balanced": "Provide a comprehensive summary of the video content, balancing visual and audio elements."
             }
             prompt_base = prompt_map.get(summary_type, prompt_map["balanced"])

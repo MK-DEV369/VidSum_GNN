@@ -13,6 +13,7 @@ from requests.exceptions import ConnectionError, ChunkedEncodingError
 from urllib3.exceptions import IncompleteRead
 
 from vidsum_gnn.utils.logging import get_logger
+from vidsum_gnn.core.config import settings
 
 logger = get_logger(__name__)
 
@@ -61,6 +62,7 @@ class WhisperTranscriber:
         """
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
+        self.whisper_language = (getattr(settings, "WHISPER_LANGUAGE", "auto") or "auto").strip().lower()
         
         logger.info(f"Loading Whisper model: {model_name}")
         
@@ -81,6 +83,11 @@ class WhisperTranscriber:
             ).to(self.device)
         )
         self.model.eval()
+
+        if self.whisper_language != "auto":
+            logger.info(f"✓ Whisper language forced: {self.whisper_language}")
+        else:
+            logger.info("✓ Whisper language: auto-detect")
         
         logger.info(f"✓ Whisper loaded on {self.device}")
     
@@ -134,12 +141,30 @@ class WhisperTranscriber:
             # Process through Whisper
             inputs = self.processor(audio, sampling_rate=16000, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            forced_decoder_ids = None
+            if self.whisper_language and self.whisper_language != "auto":
+                try:
+                    # Force a particular language while keeping the task as transcription.
+                    forced_decoder_ids = self.processor.get_decoder_prompt_ids(
+                        language=self.whisper_language,
+                        task="transcribe",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Invalid WHISPER_LANGUAGE='{self.whisper_language}' (falling back to auto-detect): {e}"
+                    )
+                    forced_decoder_ids = None
             
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     inputs["input_features"],
                     max_new_tokens=128,
-                    language="<|en|>"  # Force English
+                    # IMPORTANT:
+                    # Whisper models often ship with default forced_decoder_ids that can
+                    # effectively force English. Passing forced_decoder_ids=None clears that
+                    # and enables auto language detection.
+                    forced_decoder_ids=forced_decoder_ids,
                 )
             
             transcription = self.processor.batch_decode(
@@ -188,7 +213,6 @@ class WhisperTranscriber:
             List of transcriptions (empty string for failed files)
         """
         return [self.transcribe(path, cache_dir) for path in audio_paths]
-
 
 class TranscriptionService:
     """Thin wrapper used by the pipeline to keep a stable interface."""

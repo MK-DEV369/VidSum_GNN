@@ -59,6 +59,10 @@ dependencies = [
 
     # Config management
     "pydantic-settings>=2.1.0",
+
+    # Backend TTS (non-browser read aloud)
+    "edge-tts>=6.1.12",
+    "gTTS>=2.5.1",
 ]
 
 [project.optional-dependencies]
