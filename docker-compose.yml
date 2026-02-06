@@ -14,6 +14,7 @@ services:
       - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/vidsum
       - TRANSFORMERS_CACHE=/root/.cache/huggingface
       - HF_HOME=/root/.cache/huggingface
+      - TOKENIZERS_PARALLELISM=false
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=password
       - POSTGRES_DB=vidsum

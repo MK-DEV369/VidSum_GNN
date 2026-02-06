@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Upload, AlertCircle, CheckCircle, Clock, Download, Volume2, StopCircle, History, X, Trash2, ChevronDown, ChevronUp } from "lucide-react";
+import { Upload, AlertCircle, CheckCircle, Clock, Download, Volume2, StopCircle, History, X, Trash2, ChevronDown, ChevronUp, ChevronLeft, ChevronRight } from "lucide-react";
 import axios from "axios";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
@@ -54,6 +54,8 @@ type SummaryType = "balanced" | "visual_priority" | "audio_priority" | "highligh
 type EvidenceItem = {
   index?: number | null;
   bullet?: string | null;
+  description?: string | null;
+  justification?: string | null;
   shot_index?: number | null;
   shot_id?: string | null;
   orig_start?: number | null;
@@ -81,6 +83,8 @@ type EvidenceItem = {
 type ChapterItem = {
   index: number;
   title: string;
+  description?: string | null;
+  keywords?: string[] | null;
   merged_start: number;
   merged_end: number;
   shot_indices?: number[];
@@ -93,6 +97,7 @@ export default function DashboardPage() {
   const [textLength, setTextLength] = useState<TextLength>("medium");
   const [summaryFormat, setSummaryFormat] = useState<SummaryFormat>("bullet");
   const [summaryType, setSummaryType] = useState<SummaryType>("balanced");
+  const [leftPaneCollapsed, setLeftPaneCollapsed] = useState<boolean>(false);
   const [textSummary, setTextSummary] = useState<string | null>(null);
   const [evidenceItems, setEvidenceItems] = useState<EvidenceItem[]>([]);
   const [chapters, setChapters] = useState<ChapterItem[]>([]);
@@ -340,6 +345,28 @@ export default function DashboardPage() {
     const s = total % 60;
     if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
     return `${m}:${String(s).padStart(2, "0")}`;
+  };
+
+  const normalizeSummaryForDisplay = (summary: string, format: SummaryFormat) => {
+    const raw = String(summary ?? "");
+    if (!raw) return raw;
+
+    // If a bullet summary comes back as a single line with multiple bullet markers,
+    // split it so each bullet renders on its own line.
+    if (format === "bullet") {
+      const hasNewline = raw.includes("\n");
+      const bulletCount = (raw.match(/•/g) || []).length;
+
+      if (!hasNewline && bulletCount >= 2) {
+        const parts = raw
+          .split("•")
+          .map((p) => p.replace(/\s+/g, " ").trim())
+          .filter(Boolean);
+        return parts.map((p) => `• ${p}`).join("\n");
+      }
+    }
+
+    return raw;
   };
 
   const normalizeStageKey = (stage: string | null | undefined) => {
@@ -626,6 +653,14 @@ export default function DashboardPage() {
         lines.push(`transcript_snippet: ${item.transcript_snippet.replace(/\s+/g, " ").trim()}`);
       }
 
+      if (item.description) {
+        lines.push(`description: ${item.description.replace(/\s+/g, " ").trim()}`);
+      }
+
+      if (item.justification) {
+        lines.push(`justification: ${item.justification.replace(/\s+/g, " ").trim()}`);
+      }
+
       if (Array.isArray(item.neighbors) && item.neighbors.length > 0) {
         lines.push("neighbors:");
         item.neighbors.slice(0, 12).forEach((n) => {
@@ -864,9 +899,26 @@ export default function DashboardPage() {
       <div style={{ position: 'relative', zIndex: 1 }} className="h-full">
       <div className="container mx-auto max-w-full h-full flex flex-col gap-4">
         {/* Main Content Area */}
-        <div className={`grid grid-cols-3 gap-4 transition-all ${logsExpanded ? 'h-[60%]' : 'flex-1'} overflow-hidden`}>
-          {/* Upload & Controls - 1/3 width */}
-          <div className="col-span-1 space-y-3 overflow-y-auto pr-2">
+        <div className={`flex gap-4 transition-all ${logsExpanded ? 'h-[65%]' : 'flex-1'} overflow-hidden`}>
+          {/* Left: Settings Pane (collapsible) */}
+          <div
+            className={`shrink-0 overflow-hidden transition-[width] duration-300 ease-in-out ${leftPaneCollapsed ? "w-12" : "w-[360px]"}`}
+            aria-label="Settings pane"
+          >
+            <div className={`h-full ${leftPaneCollapsed ? "flex items-center justify-center" : "space-y-3 overflow-y-auto pr-2"}`}>
+              {leftPaneCollapsed ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setLeftPaneCollapsed(false)}
+                  className="h-9 w-9 p-0 bg-white/5 hover:bg-white/10 border border-white/10"
+                  title="Show settings"
+                  aria-label="Show settings"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </Button>
+              ) : (
+                <>
             <Card className="bg-white/10 border-white/20 backdrop-blur-sm">
               <CardContent className="space-y-4">
                 <div className="border-2 border-dashed border-primary/20 rounded-lg p-6 text-center cursor-pointer hover:border-primary/50 transition">
@@ -895,26 +947,41 @@ export default function DashboardPage() {
                   <Button 
                     onClick={handleUpload}
                     disabled={!file || state.status === "processing"}
-                    className="w-full bg-gradient-to-r from-slate-700 via-slate-600 to-slate-700 hover:from-slate-600 hover:via-slate-500 hover:to-slate-600 text-white font-semibold transition-all border border-white/10"
+                    className="w-full bg-gradient-to-r from-emerald-600/60 to-cyan-600/60 hover:from-emerald-500/70 hover:to-cyan-500/70 text-white font-semibold transition-all border border-emerald-400/40"
                   >
                     {state.status === "uploading" ? "Uploading..." : "Upload & Process"}
                   </Button>
                   <Button
                     onClick={handleReset}
                     disabled={state.status === "processing"}
-                    className="w-full bg-gradient-to-r from-slate-800 to-slate-700 hover:from-slate-700 hover:to-slate-600 text-white font-semibold transition-all border border-white/10"
+                    className="w-full bg-gradient-to-r from-amber-600/60 to-red-600/60 hover:from-amber-500/70 hover:to-red-500/70 text-white font-semibold transition-all border border-amber-400/40"
                   >
                     Reset
                   </Button>
                 </div>
 
-                <Button
-                  onClick={() => setShowHistory(true)}
-                  className="w-full flex items-center gap-2 bg-gradient-to-r from-slate-800 via-slate-700 to-slate-800 hover:from-slate-700 hover:via-slate-600 hover:to-slate-700 text-white font-semibold transition-all border border-white/10"
-                >
-                  <History className="w-4 h-4" />
-                  History ({summaryHistory.length})
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    onClick={() => setShowHistory(true)}
+                    className="flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-slate-800 via-slate-700 to-slate-800 hover:from-slate-700 hover:via-slate-600 hover:to-slate-700 text-white font-semibold transition-all border border-white/10 min-w-0"
+                    title="Open history"
+                  >
+                    <History className="w-4 h-4 shrink-0" />
+                    <span className="truncate">History ({summaryHistory.length})</span>
+                  </Button>
+
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setLeftPaneCollapsed(true)}
+                    className="h-9 w-9 p-0 bg-white/5 hover:bg-white/10 border border-white/10 shrink-0"
+                    title="Hide settings"
+                    aria-label="Hide settings"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </Button>
+                </div>
               </CardContent>
             </Card>
 
@@ -949,7 +1016,7 @@ export default function DashboardPage() {
                         className="text-[10px] font-semibold text-white/90 truncate"
                         title={String(state.currentStage || "") || undefined}
                       >
-                        {stageLabel(state.currentStage)} · {Math.max(0, Math.min(100, state.progress))}%
+                        {stageLabel(state.currentStage)}
                       </span>
                     </div>
                   </div>
@@ -968,7 +1035,7 @@ export default function DashboardPage() {
             </Card>
 
             {/* Controls */}
-            <Card className="bg-white/10 border-white/20 backdrop-blur-sm\">
+            <Card className="bg-white/10 border-white/20 backdrop-blur-sm">
               <CardContent className="space-y-4">
                 {/* Text Length & Format - 2 Column Grid */}
                 <div className="grid grid-cols-2 gap-4">
@@ -987,13 +1054,13 @@ export default function DashboardPage() {
                           size="sm"
                           onClick={() => setTextLength(len)}
                           disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
-                          className={`capitalize text-xs px-2 font-semibold transition-all ${
+                          className={`capitalize text-xs px-2 font-semibold transition-all min-w-0 whitespace-nowrap ${
                             textLength === len
                               ? "bg-gradient-to-r from-violet-600 to-blue-600 hover:from-violet-700 hover:to-blue-700 text-white"
                               : "bg-gradient-to-r from-violet-500/30 to-blue-500/30 hover:from-violet-500/50 hover:to-blue-500/50 text-white border border-violet-500/50"
                           }`}
                         >
-                          {len}
+                          <span className="truncate">{len}</span>
                         </Button>
                       ))}
                     </div>
@@ -1014,13 +1081,14 @@ export default function DashboardPage() {
                           size="sm"
                           onClick={() => setSummaryFormat(fmt)}
                           disabled={state.status === "processing" || state.status === "uploading" || state.status === "completed"}
-                          className={`capitalize text-xs px-2 font-semibold transition-all ${
+                          className={`capitalize text-[11px] px-1 font-semibold transition-all min-w-0 whitespace-nowrap ${
                             summaryFormat === fmt
                               ? "bg-gradient-to-r from-pink-600 to-violet-600 hover:from-pink-700 hover:to-violet-700 text-white"
                               : "bg-gradient-to-r from-pink-500/30 to-violet-500/30 hover:from-pink-500/50 hover:to-violet-500/50 text-white border border-pink-500/50"
                           }`}
+                          title={fmt}
                         >
-                          {fmt}
+                          <span className="truncate">{fmt}</span>
                         </Button>
                       ))}
                     </div>
@@ -1146,10 +1214,13 @@ export default function DashboardPage() {
                 </div>
               </CardContent>
             </Card>
+                </>
+              )}
+            </div>
           </div>
 
-          {/* Right: Output - 2/3 width */}
-          <div className="col-span-2 overflow-hidden h-full flex flex-col">
+          {/* Right: Output */}
+          <div className="flex-1 overflow-hidden h-full flex flex-col">
             {state.status === "completed" || textSummary ? (
               <div className={`h-full grid gap-4 overflow-hidden ${showSidePanel ? "grid-cols-2" : "grid-cols-1"}`}>
                 {/* Left: Intended summary output */}
@@ -1213,7 +1284,10 @@ export default function DashboardPage() {
                       <CardContent className="flex-1 overflow-y-auto mb-4">
                         <div className="bg-white/5 rounded-lg p-4 prose prose-sm max-w-none">
                           <pre className="whitespace-pre-wrap font-sans text-sm text-white">
-                            {textSummary}
+                            {normalizeSummaryForDisplay(
+                              textSummary,
+                              (processingConfig?.format || summaryFormat) as SummaryFormat
+                            )}
                           </pre>
                         </div>
                       </CardContent>
@@ -1343,6 +1417,16 @@ export default function DashboardPage() {
                                   {formatChapterTitle(ch.title, ch.index)}
                                 </p>
                                 <p className="text-xs text-slate-300">{formatTime(ch.merged_start)} – {formatTime(ch.merged_end)}</p>
+                                {ch.description && (
+                                  <p className="text-xs text-slate-300 mt-1 line-clamp-2 break-words whitespace-normal">
+                                    {ch.description}
+                                  </p>
+                                )}
+                                {Array.isArray(ch.keywords) && ch.keywords.length > 0 && (
+                                  <p className="text-[11px] text-slate-400 mt-1 truncate" title={ch.keywords.join(", ")}>
+                                    Keywords: {ch.keywords.join(", ")}
+                                  </p>
+                                )}
                               </div>
                               <span className="text-xs text-slate-300 shrink-0">Chapter {ch.index + 1}</span>
                             </button>
@@ -1434,6 +1518,11 @@ export default function DashboardPage() {
                                           Importance: {typeof item.score === "number" ? item.score.toFixed(3) : "—"}
                                         </p>
                                       </div>
+                                      {item.description && (
+                                        <p className="text-xs text-slate-200 mt-1 line-clamp-2 break-words whitespace-normal">
+                                          {item.description}
+                                        </p>
+                                      )}
                                       {item.transcript_snippet && (
                                         <p className="text-xs text-slate-300 mt-1 line-clamp-2 break-all whitespace-normal">
                                           {item.transcript_snippet}
@@ -1456,6 +1545,14 @@ export default function DashboardPage() {
                                 {expanded && (
                                   <div className="mt-3 pt-3 border-t border-white/10 grid grid-cols-2 gap-3 overflow-hidden min-w-0">
                                     <div className="space-y-2 min-w-0">
+                                      {item.justification && (
+                                        <div className="pb-2">
+                                          <p className="text-xs text-white font-semibold">Justification</p>
+                                          <p className="text-xs text-slate-300 mt-1 break-words whitespace-normal">
+                                            {item.justification}
+                                          </p>
+                                        </div>
+                                      )}
                                       <p className="text-xs text-white font-semibold">Top contributing signals</p>
 
                                       {([
@@ -1523,8 +1620,8 @@ export default function DashboardPage() {
         </div>
 
         {/* Bottom: Toggleable Logs */}
-        <div className={`transition-all overflow-hidden ${logsExpanded ? 'h-[35%]' : 'h-12'}`}>
-          <Card className="h-full flex flex-col bg-white/10 border-white/20 backdrop-blur-sm\">
+        <div className={`transition-all overflow-hidden ${logsExpanded ? 'h-[30%]' : 'h-12'}`}>
+          <Card className="h-full flex flex-col bg-white/10 border-white/20 backdrop-blur-sm">
             <CardHeader 
               className="pb-2 pt-3 cursor-pointer hover:bg-white/20 transition-colors"
               onClick={() => setLogsExpanded(!logsExpanded)}

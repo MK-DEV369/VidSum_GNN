@@ -63,6 +63,9 @@ dependencies = [
     # Backend TTS (non-browser read aloud)
     "edge-tts>=6.1.12",
     "gTTS>=2.5.1",
+
+    # Optional: Gemini API fallback/override summarizer
+    "google-genai>=0.6.0",
 ]
 
 [project.optional-dependencies]

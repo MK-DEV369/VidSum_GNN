@@ -3,7 +3,9 @@ import gc
 from transformers import ViTImageProcessor, ViTModel
 from PIL import Image
 from typing import List
-import numpy as np
+from vidsum_gnn.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 class VisualEncoder:
     """
@@ -38,10 +40,10 @@ class VisualEncoder:
             images = []
             for p in batch_paths:
                 try:
-                    img = Image.open(p).convert("RGB")
-                    images.append(img)
+                    with Image.open(p) as img:
+                        images.append(img.convert("RGB"))
                 except Exception as e:
-                    print(f"Error loading image {p}: {e}")
+                    logger.warning(f"Error loading image {p}: {e}")
                     images.append(Image.new("RGB", (224, 224)))
             
             if not images:
@@ -52,6 +54,9 @@ class VisualEncoder:
             with torch.no_grad():
                 outputs = self.model(**inputs)
                 batch_embeddings = outputs.pooler_output
+                if batch_embeddings is None:
+                    batch_embeddings = outputs.last_hidden_state[:, 0, :]
+                batch_embeddings = torch.nn.functional.normalize(batch_embeddings, p=2, dim=1)
                 embeddings.append(batch_embeddings.cpu())
             
             # Cleanup

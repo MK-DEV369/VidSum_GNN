@@ -1,5 +1,5 @@
 import gc
-import logging
+import time
 from typing import List, Optional
 
 import numpy as np
@@ -7,7 +7,9 @@ import torch
 import torchaudio
 from transformers import HubertModel, Wav2Vec2FeatureExtractor
 
-logger = logging.getLogger(__name__)
+from vidsum_gnn.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 class AudioEncoder:
     """
@@ -110,12 +112,33 @@ class AudioEncoder:
         Returns:
             Tensor of shape (batch_size, 768) - mean-pooled HuBERT hidden states
         """
+        t0 = time.monotonic()
         embeddings = []
+        ok = 0
+        failed = 0
+        empty = 0
+        total_seconds = 0.0
+
+        logger.info(
+            f"[AudioEncoder] Encoding {len(audio_paths)} audio segments (device={self.device}, "
+            f"segment_seconds={self.segment_seconds}, max_audio_seconds={self.max_audio_seconds})"
+        )
         
         for p in audio_paths:
             try:
                 # Load audio file
                 waveform, sr = torchaudio.load(p)
+
+                if waveform.numel() == 0:
+                    empty += 1
+                    embeddings.append(torch.zeros(1, 768))
+                    continue
+
+                # Track duration for debugging
+                try:
+                    total_seconds += float(waveform.shape[-1]) / float(sr or 1)
+                except Exception:
+                    pass
                 
                 # Resample to 16kHz if needed
                 if sr != self.target_sr:
@@ -132,6 +155,11 @@ class AudioEncoder:
                 if not segments:
                     embeddings.append(torch.zeros(1, 768))
                     continue
+
+                if logger.logger.isEnabledFor(10):
+                    logger.debug(
+                        f"[AudioEncoder] {p}: sr={sr}, samples={int(input_values.numel())}, segments={len(segments)}"
+                    )
 
                 # Try on current device; if we hit CUDA OOM, permanently fall back to CPU.
                 pooled_segments: List[torch.Tensor] = []
@@ -158,6 +186,7 @@ class AudioEncoder:
 
                 pooled = torch.mean(torch.cat(pooled_segments, dim=0), dim=0, keepdim=True)
                 embeddings.append(pooled.cpu())
+                ok += 1
 
                 # Cleanup
                 del waveform, pooled, pooled_segments, segments, input_values
@@ -166,11 +195,22 @@ class AudioEncoder:
                 gc.collect()
                     
             except Exception as e:
-                logger.warning("Error processing audio %s: %s", p, e)
+                failed += 1
+                logger.warning(f"[AudioEncoder] Error processing audio {p}: {type(e).__name__}: {e}")
                 # Return zero vector on error
                 embeddings.append(torch.zeros(1, 768))
         
         if not embeddings:
             return torch.empty(0, 768)
-            
-        return torch.cat(embeddings, dim=0)
+
+        out = torch.cat(embeddings, dim=0)
+        dt = time.monotonic() - t0
+        try:
+            avg_sec = (total_seconds / max(1, (ok + failed + empty)))
+        except Exception:
+            avg_sec = 0.0
+        logger.info(
+            f"[AudioEncoder] Done: out={tuple(out.shape)}, ok={ok}, failed={failed}, empty={empty}, "
+            f"avg_input_sec={avg_sec:.2f}, wall={dt:.1f}s"
+        )
+        return out

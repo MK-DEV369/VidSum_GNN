@@ -42,10 +42,36 @@ def extract_handcrafted_features(
     """
     num_shots = len(shots_times)
     features = []
+
+    if num_shots == 0:
+        logger.warning("No shots provided for handcrafted features")
+        return torch.empty(0, 14, dtype=torch.float32)
+
+    # Quick stats for debugging shot detection/segmentation behavior
+    try:
+        durs = [float(e - s) for s, e in shots_times if (e - s) > 0]
+        if durs:
+            logger.info(
+                f"Handcrafted inputs: shots={num_shots}, duration={float(video_duration):.2f}s, "
+                f"shot_dur_min={min(durs):.2f}s, shot_dur_med={float(np.median(durs)):.2f}s, shot_dur_max={max(durs):.2f}s"
+            )
+    except Exception:
+        logger.info(f"Handcrafted inputs: shots={num_shots}, duration={float(video_duration):.2f}s")
     
     for i, (start, end) in enumerate(shots_times):
         duration = end - start
         relative_pos = (start + end) / 2 / video_duration if video_duration > 0 else 0.5
+
+        # scene_cut_strength proxy: very short segments often correspond to transitions/cuts.
+        # This is a cheap heuristic (no frame-level analysis).
+        if duration <= 0:
+            cut_strength = 0.0
+        elif duration < 1.2:
+            cut_strength = 1.0
+        elif duration < 3.0:
+            cut_strength = 0.75
+        else:
+            cut_strength = 0.5
         
         # Core temporal features (actually computed)
         shot_features = [
@@ -60,7 +86,7 @@ def extract_handcrafted_features(
             0.0,                       # 9. pitch_mean (placeholder)
             0.0,                       # 10. pitch_std (placeholder)
             0.0,                       # 11. silence_ratio (placeholder)
-            1.0 if i == 0 else 0.5,   # 12. scene_cut_strength (strong at start)
+            cut_strength,              # 12. scene_cut_strength (duration proxy)
             0.0,                       # 13. color_hist_delta (placeholder)
             0.0                        # 14. is_silent (placeholder)
         ]

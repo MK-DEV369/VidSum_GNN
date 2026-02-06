@@ -9,6 +9,7 @@ import subprocess
 from collections import Counter
 from pathlib import Path
 from datetime import datetime, timedelta
+import glob
 from sqlalchemy.ext.asyncio import AsyncSession
 from vidsum_gnn.db.client import AsyncSessionLocal
 from vidsum_gnn.db.models import Video, Shot, Summary
@@ -26,10 +27,300 @@ from vidsum_gnn.core.config import settings
 from vidsum_gnn.utils.logging import get_logger
 from vidsum_gnn.inference.service import get_inference_service
 from vidsum_gnn.inference.gemini_fallback import get_gemini_summarizer
+from vidsum_gnn.inference.summarization import _clean_transcript_text
 from PIL import Image
 import numpy as np
 
 logger = get_logger(__name__)
+
+
+def _safe_remove_path(path: str) -> None:
+    """Remove a file or directory path if it exists; ignore errors."""
+    if not path:
+        return
+    try:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _cleanup_video_artifacts(
+    *,
+    video_id: str,
+    uploaded_file_path: str | None,
+    canonical_path: str | None,
+    keep_outputs: bool = True,
+) -> None:
+    """Cleanup per-video cache/intermediate files without breaking history by default."""
+    # Upload file
+    if getattr(settings, "CLEANUP_UPLOADS", True) and uploaded_file_path:
+        _safe_remove_path(uploaded_file_path)
+
+    # Processed dir (per-shot audio/keyframes/etc)
+    if getattr(settings, "CLEANUP_PROCESSED", True):
+        _safe_remove_path(os.path.join(settings.PROCESSED_DIR, video_id))
+        # Defensive: remove any chunk processed dirs that may remain
+        for p in glob.glob(os.path.join(settings.PROCESSED_DIR, f"{video_id}_chunk_*") ):
+            _safe_remove_path(p)
+
+    # Temp artifacts
+    if getattr(settings, "CLEANUP_TEMP", True):
+        # Per-video temp workspace (motion, etc)
+        _safe_remove_path(os.path.join(settings.TEMP_DIR, video_id))
+        # Any top-level temp files created for this video (canonical/chunks/concat/important_shots)
+        for p in glob.glob(os.path.join(settings.TEMP_DIR, f"{video_id}_*")):
+            _safe_remove_path(p)
+        # Canonical file (sometimes uses original basename and may not match video_id prefix)
+        if canonical_path and os.path.exists(canonical_path):
+            _safe_remove_path(canonical_path)
+
+    # Outputs are part of history (merged video + thumbnails + tts). Only delete if explicitly enabled.
+    if not keep_outputs and getattr(settings, "CLEANUP_OUTPUTS", False):
+        _safe_remove_path(os.path.join(settings.OUTPUT_DIR, "keyframes", video_id))
+        _safe_remove_path(os.path.join(settings.OUTPUT_DIR, "merged", f"{video_id}.mp4"))
+        _safe_remove_path(os.path.join(settings.OUTPUT_DIR, "tts", video_id))
+
+
+def _evidence_bullet_from_transcript(text: str, shot_index: int) -> str:
+    cleaned = _clean_transcript_text(text or "")
+    if cleaned:
+        garbage_words = {"commission", "times", "everyone", "importantly"}
+        parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", cleaned.strip()) if p.strip()]
+        # Prefer a sentence with at least ~3 content words.
+        for p in parts[:4]:
+            words = re.findall(r"[A-Za-z]{2,}", p.lower())
+            if len(words) >= 3 and words[0] not in garbage_words:
+                first = re.sub(r"\s+", " ", p).strip()
+                if len(first) > 120:
+                    first = first[:120].rstrip() + "…"
+                return first
+        # Fallback: accept a slightly shorter (but non-garbage) sentence.
+        for p in parts[:4]:
+            words = re.findall(r"[A-Za-z]{2,}", p.lower())
+            if len(words) >= 2 and words[0] not in garbage_words:
+                first = re.sub(r"\s+", " ", p).strip()
+                if len(first) > 120:
+                    first = first[:120].rstrip() + "…"
+                return first
+    return f"Shot {shot_index}"
+
+
+def _first_meaningful_sentences(text: str, max_sentences: int = 2) -> list[str]:
+    cleaned = _clean_transcript_text(text or "")
+    if not cleaned:
+        return []
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", cleaned.strip()) if p.strip()]
+    out: list[str] = []
+    for p in parts[:8]:
+        # Skip extremely short/noisy fragments
+        words = re.findall(r"[A-Za-z]{2,}", p)
+        if len(words) < 4:
+            continue
+        s = re.sub(r"\s+", " ", p).strip()
+        if len(s) > 220:
+            s = s[:220].rstrip() + "…"
+        out.append(s)
+        if len(out) >= max_sentences:
+            break
+    return out
+
+
+def _evidence_heading_description(
+    transcript_snippet: str,
+    shot_index: int,
+    signals: dict | None,
+) -> tuple[str, str | None]:
+    """Return (heading, description) for evidence.
+
+    Heading should be short and scan-friendly; description can be longer.
+    """
+    heading = _evidence_bullet_from_transcript(transcript_snippet, shot_index)
+    heading = re.sub(r"^[•\-\*\s]+", "", str(heading or "")).strip()
+
+    sentences = _first_meaningful_sentences(transcript_snippet, max_sentences=2)
+    description: str | None = None
+    if sentences:
+        # If the heading is basically the first sentence, use the next sentence as description.
+        if heading and sentences and heading.rstrip(".!") == sentences[0].rstrip(".!"):
+            description = sentences[1] if len(sentences) > 1 else None
+        else:
+            description = " ".join(sentences[:2]).strip() or None
+
+    # If we still have no description, fall back to an interpretable signals summary.
+    if not description:
+        sig = signals or {}
+        motion = sig.get("motion")
+        audio_rms = sig.get("audio_rms")
+        scene_change = sig.get("scene_change")
+        transcript_density = sig.get("transcript_density")
+
+        parts: list[str] = []
+        if isinstance(motion, (int, float)) and not math.isnan(float(motion)):
+            parts.append(f"motion={float(motion):.3f}")
+        if isinstance(scene_change, (int, float)) and not math.isnan(float(scene_change)):
+            parts.append(f"scene_change={float(scene_change):.3f}")
+        if isinstance(audio_rms, (int, float)) and not math.isnan(float(audio_rms)):
+            parts.append(f"audio_rms={float(audio_rms):.3f}")
+        if isinstance(transcript_density, (int, float)) and not math.isnan(float(transcript_density)):
+            parts.append(f"transcript_density={float(transcript_density):.3f}")
+
+        if parts:
+            description = "Selected due to " + ", ".join(parts[:3]) + "."
+
+    if not heading:
+        heading = f"Shot {shot_index}"
+    if len(heading) > 140:
+        heading = heading[:140].rstrip() + "…"
+    return heading, description
+
+
+def _evidence_justification(
+    score: float | None,
+    signals: dict | None,
+    neighbors: list[dict] | None,
+    normalized_signals: dict[str, float] | None = None,
+) -> str:
+    sig = signals or {}
+    nrm = normalized_signals or {}
+
+    # Prefer normalized signals when available, so "top reasons" is comparable.
+    candidates: list[tuple[str, float]] = []
+    for k in ("motion", "scene_change", "audio_rms", "transcript_density"):
+        v = nrm.get(k)
+        if isinstance(v, (int, float)) and not math.isnan(float(v)):
+            candidates.append((k, float(v)))
+    candidates = sorted(candidates, key=lambda kv: kv[1], reverse=True)
+    top_reasons = [f"{k.replace('_', ' ')}" for k, _v in candidates[:2]]
+
+    # Neighbor summary
+    sem = [n for n in (neighbors or []) if n.get("edge_type") == "semantic"]
+    tmp = [n for n in (neighbors or []) if n.get("edge_type") == "temporal"]
+    best_sim = None
+    try:
+        best_sim = max([float(n.get("similarity") or 0.0) for n in sem]) if sem else None
+    except Exception:
+        best_sim = None
+    closest_sec = None
+    try:
+        dists = [float(n.get("distance_sec")) for n in tmp if isinstance(n.get("distance_sec"), (int, float))]
+        closest_sec = min([abs(d) for d in dists]) if dists else None
+    except Exception:
+        closest_sec = None
+
+    parts: list[str] = []
+    if isinstance(score, (int, float)) and not math.isnan(float(score)):
+        parts.append(f"score={float(score):.4f}")
+    if top_reasons:
+        parts.append("top signals: " + ", ".join(top_reasons))
+    if sem and best_sim is not None:
+        parts.append(f"semantic neighbors: {len(sem)} (best sim {best_sim:.2f})")
+    elif sem:
+        parts.append(f"semantic neighbors: {len(sem)}")
+    if tmp and closest_sec is not None:
+        parts.append(f"temporal neighbors: {len(tmp)} (closest {int(round(closest_sec))}s)")
+    elif tmp:
+        parts.append(f"temporal neighbors: {len(tmp)}")
+
+    return "; ".join(parts) if parts else "Selected based on importance score and graph signals."
+
+
+def _normalize_metric(values: list[float | None]) -> list[float]:
+    cleaned: list[float] = [v for v in values if isinstance(v, (int, float)) and not math.isnan(float(v))]
+    if not cleaned:
+        return [0.0 for _ in values]
+    mn = float(min(cleaned))
+    mx = float(max(cleaned))
+    denom = (mx - mn) if (mx - mn) != 0 else 1.0
+    out: list[float] = []
+    for v in values:
+        if not isinstance(v, (int, float)) or math.isnan(float(v)):
+            out.append(0.0)
+        else:
+            out.append(max(0.0, min(1.0, (float(v) - mn) / denom)))
+    return out
+
+
+def _adjust_scores_for_summary_type(
+    summary_type: str,
+    base_scores: list[float],
+    transcripts: list[str],
+    shots_times: list[tuple[float, float]],
+    audio_paths: list[str],
+    keyframe_paths: list[str],
+) -> list[float]:
+    """Adjust GNN scores using lightweight proxies so summary_type influences shot selection.
+
+    Note: This is heuristic. True audio/visual understanding would require modality-specific models.
+    """
+    st = str(summary_type or "balanced")
+    if st == "balanced":
+        return [float(s) for s in base_scores]
+
+    n = len(base_scores)
+    durations: list[float | None] = []
+    densities: list[float | None] = []
+    audio_rms: list[float | None] = []
+    scene_change: list[float | None] = []
+
+    for i in range(n):
+        try:
+            start, end = shots_times[i] if i < len(shots_times) else (0.0, 0.0)
+            d = float(end) - float(start)
+            durations.append(max(0.0, d))
+        except Exception:
+            durations.append(None)
+
+        try:
+            wc = _safe_word_count(transcripts[i] if i < len(transcripts) else "")
+            d2 = durations[-1] if durations else None
+            if isinstance(d2, (int, float)) and d2 > 0:
+                densities.append(float(wc) / max(0.25, float(d2)))
+            else:
+                densities.append(float(wc))
+        except Exception:
+            densities.append(None)
+
+        try:
+            ap = audio_paths[i] if i < len(audio_paths) else None
+            audio_rms.append(_audio_rms_energy(ap) if ap else None)
+        except Exception:
+            audio_rms.append(None)
+
+        try:
+            if i <= 0:
+                scene_change.append(None)
+            else:
+                prev_kf = keyframe_paths[i - 1] if i - 1 < len(keyframe_paths) else None
+                cur_kf = keyframe_paths[i] if i < len(keyframe_paths) else None
+                if prev_kf and cur_kf:
+                    scene_change.append(_histogram_delta(prev_kf, cur_kf))
+                else:
+                    scene_change.append(None)
+        except Exception:
+            scene_change.append(None)
+
+    dur_n = _normalize_metric(durations)
+    dens_n = _normalize_metric(densities)
+    audio_n = _normalize_metric(audio_rms)
+    scene_n = _normalize_metric(scene_change)
+
+    adjusted: list[float] = []
+    for i in range(n):
+        base = float(base_scores[i])
+        if st == "audio_priority":
+            s = (0.70 * base) + (0.20 * audio_n[i]) + (0.10 * dens_n[i])
+        elif st == "visual_priority":
+            s = (0.70 * base) + (0.20 * scene_n[i]) + (0.10 * dur_n[i])
+        elif st == "highlights":
+            s = (0.60 * base) + (0.20 * audio_n[i]) + (0.20 * scene_n[i])
+        else:
+            s = base
+        adjusted.append(float(s))
+
+    return adjusted
 
 # Batch processing constants
 CHUNK_DURATION = int(os.getenv("LONG_VIDEO_CHUNK_DURATION", "900"))  # seconds
@@ -264,6 +555,8 @@ _STOPWORDS = {
     "okay","ok","right","like","yeah","yes","no","uh","um","hmm","well","maybe","kind","kinda","sort","sorta",
     "thing","things","stuff","people","someone","something",
     "doing","does","did","done","make","makes","made","adding","addition","add",
+    # Noisy ASR artifacts that frequently dominate chapter titles
+    "commission","times","everyone","importantly","start",
 }
 
 
@@ -279,6 +572,17 @@ def _chapter_title(texts: list[str], index: int) -> str:
 
     # Prefer slightly more specific keywords: skip very low-signal repeats.
     counts = Counter(words)
+
+    # If the transcript is essentially one repeated word, treat as low-signal and fallback.
+    try:
+        most_common = counts.most_common(1)
+        if most_common:
+            top_word, top_count = most_common[0]
+            if len(counts) <= 2 and (top_count / max(1, len(words))) >= 0.75:
+                return f"Chapter {index + 1}"
+    except Exception:
+        pass
+
     candidates: list[str] = []
     for w, _c in counts.most_common(12):
         if w in _STOPWORDS:
@@ -292,12 +596,52 @@ def _chapter_title(texts: list[str], index: int) -> str:
 
     if len(candidates) < 2:
         # Fall back to a short snippet of content words.
-        snippet_words = [w for w in words if w not in _STOPWORDS][:6]
+        snippet_words_raw = [w for w in words if w not in _STOPWORDS][:12]
+        seen: set[str] = set()
+        snippet_words: list[str] = []
+        for w in snippet_words_raw:
+            if w in seen:
+                continue
+            seen.add(w)
+            snippet_words.append(w)
+            if len(snippet_words) >= 6:
+                break
         snippet = " ".join([w.capitalize() for w in snippet_words]).strip()
         return snippet or f"Chapter {index + 1}"
 
     title = " · ".join([w.capitalize() for w in candidates])
     return title or f"Chapter {index + 1}"
+
+
+def _chapter_description(texts: list[str], index: int, title: str) -> str:
+    blob = " ".join([t for t in texts if t]).strip()
+    if blob:
+        sentences = _first_meaningful_sentences(blob, max_sentences=2)
+        if sentences:
+            desc = " ".join(sentences[:2]).strip()
+            # Avoid repeating the title keywords verbatim as the whole description.
+            if desc and desc.lower() != (title or "").lower():
+                return desc
+    return f"Chapter {index + 1} segment in the merged summary."
+
+
+def _chapter_keywords(texts: list[str], max_keywords: int = 5) -> list[str]:
+    blob = " ".join([t for t in texts if t]).strip()
+    if not blob:
+        return []
+    words = [w.lower() for w in re.findall(r"[a-zA-Z]{3,}", blob)]
+    words = [w for w in words if w not in _STOPWORDS]
+    if not words:
+        return []
+    counts = Counter(words)
+    out: list[str] = []
+    for w, _c in counts.most_common(20):
+        if w in _STOPWORDS or w in {"video", "audio", "sound"}:
+            continue
+        out.append(w)
+        if len(out) >= max_keywords:
+            break
+    return out
 
 
 def _build_chapters_from_manifest(
@@ -342,9 +686,12 @@ def _build_chapters_from_manifest(
         s1 = ch["segments"][-1]
         shot_indices = [int(s.get("shot_index")) for s in ch["segments"] if s.get("shot_index") is not None]
         texts = [transcriptions[i] for i in shot_indices if 0 <= i < len(transcriptions)]
+        title = _chapter_title(texts, idx)
         out.append({
             "index": idx,
-            "title": _chapter_title(texts, idx),
+            "title": title,
+            "description": _chapter_description(texts, idx, title),
+            "keywords": _chapter_keywords(texts, max_keywords=5),
             "merged_start": float(s0.get("merged_start") or 0.0),
             "merged_end": float(s1.get("merged_end") or 0.0),
             "shot_indices": shot_indices,
@@ -472,7 +819,12 @@ async def process_video_chunk(
         shots_times = [(s, e) for s, e in shots_times if (e - s) >= LONG_MIN_SHOT_DURATION]
         shots_times = _merge_shots_to_cap(shots_times, LONG_MAX_SHOTS_PER_CHUNK)
 
-        keyframe_paths = await sample_frames_for_shots(chunk_path, shots_times, f"{video_id}_chunk_{chunk_index}")
+        keyframe_paths, frames_per_shot = await sample_frames_for_shots(
+            chunk_path,
+            shots_times,
+            f"{video_id}_chunk_{chunk_index}",
+            frames_per_shot=3,
+        )
         
         audio_dir = os.path.join(settings.PROCESSED_DIR, f"{video_id}_chunk_{chunk_index}", "audio")
         os.makedirs(audio_dir, exist_ok=True)
@@ -486,7 +838,22 @@ async def process_video_chunk(
         vis_encoder = VisualEncoder()
         aud_encoder = AudioEncoder()
         
-        vis_feats = vis_encoder.encode(keyframe_paths)  # (N, 768)
+        frame_feats = vis_encoder.encode(keyframe_paths)  # (sum frames, 768)
+        # Aggregate frame embeddings back to shot-level (mean pooling)
+        shot_embs = []
+        offset = 0
+        for n in frames_per_shot:
+            if n <= 0:
+                shot_embs.append(torch.zeros(768))
+                continue
+            slice_feats = frame_feats[offset : offset + n]
+            offset += n
+            if slice_feats.numel() == 0:
+                shot_embs.append(torch.zeros(768))
+            else:
+                shot_embs.append(slice_feats.mean(dim=0))
+        vis_feats = torch.stack(shot_embs) if shot_embs else torch.empty(0, 768)
+
         aud_feats = aud_encoder.encode(audio_paths)     # (N, 768)
         
         # Clear CUDA memory after feature extraction
@@ -700,25 +1067,73 @@ async def process_video_task(video_id: str, config: dict):
                     try:
                         await extract_audio_segment(canonical_path, float(start_sec), float(end_sec), audio_path)
                         t = transcriber.transcribe(Path(audio_path), cache_dir=None)
-                        transcripts[idx] = (t or "").strip()
+                        transcripts[idx] = _clean_transcript_text((t or "").strip())
                     except Exception as e:
                         logger.warning(f"Top-shot transcription failed (idx={idx}): {e}")
 
+                # Reweight scores for summary_type using proxies we can compute for the top shots.
+                # (We don't have full-video per-shot audio/motion at this stage.)
+                scores_for_summary = [float(s) for s in all_scores]
+                if summary_type in ("audio_priority", "visual_priority", "highlights") and top_indices_sorted:
+                    top_dur: list[float | None] = []
+                    top_dens: list[float | None] = []
+                    top_audio: list[float | None] = []
+                    for idx in top_indices_sorted:
+                        try:
+                            start_sec, end_sec = all_shots_times[idx]
+                            d = float(end_sec) - float(start_sec)
+                            d = max(0.0, d)
+                        except Exception:
+                            d = 0.0
+                        top_dur.append(d)
+
+                        try:
+                            wc = _safe_word_count(transcripts[idx] if idx < len(transcripts) else "")
+                            top_dens.append(float(wc) / max(0.25, float(d)) if d > 0 else float(wc))
+                        except Exception:
+                            top_dens.append(None)
+
+                        try:
+                            ap = os.path.join(audio_tmp_dir, f"shot_{idx:04d}.mp3")
+                            top_audio.append(_audio_rms_energy(ap))
+                        except Exception:
+                            top_audio.append(None)
+
+                    dur_n = _normalize_metric(top_dur)
+                    dens_n = _normalize_metric(top_dens)
+                    audio_n = _normalize_metric(top_audio)
+
+                    for j, idx in enumerate(top_indices_sorted):
+                        base = float(scores_for_summary[idx])
+                        if summary_type == "audio_priority":
+                            scores_for_summary[idx] = (0.70 * base) + (0.20 * audio_n[j]) + (0.10 * dens_n[j])
+                        elif summary_type == "visual_priority":
+                            # Best-effort proxy here: longer shots often reflect visual continuity.
+                            scores_for_summary[idx] = (0.80 * base) + (0.20 * dur_n[j])
+                        elif summary_type == "highlights":
+                            scores_for_summary[idx] = (0.70 * base) + (0.30 * audio_n[j])
+
                 summarizer = inference_service.manager.get_summarizer()
+                try:
+                    nonempty = sum(1 for t in transcripts if t and t.strip())
+                    total_words = sum(_safe_word_count(t) for t in transcripts if t and t.strip())
+                    logger.info(f"Transcript stats: nonempty={nonempty}/{len(transcripts)}, total_words={total_words}")
+                    if total_words < 25:
+                        logger.warning(
+                            "Transcript signal is sparse/noisy; summary may be shorter or rely more on visual cues"
+                        )
+                except Exception:
+                    # Never let diagnostics break the pipeline.
+                    pass
                 all_formats = summarizer.summarize_all_formats(
                     transcripts=transcripts,
-                    gnn_scores=all_scores,
+                    gnn_scores=scores_for_summary,
                     summary_type=summary_type,
                     text_length=text_length,
                     top_k=top_k,
+                    video_path=canonical_path,
+                    formats=[summary_format],
                 )
-
-                # Evidence items (align bullets to top indices)
-                bullet_lines = [
-                    line.strip().lstrip("•").strip()
-                    for line in (all_formats.get("bullet") or "").splitlines()
-                    if line.strip().startswith("•")
-                ]
 
                 # Persist keyframes only for evidence shots
                 keyframes_out_dir = os.path.join(settings.OUTPUT_DIR, "keyframes", video_id)
@@ -736,7 +1151,8 @@ async def process_video_task(video_id: str, config: dict):
                     if shot_obj is not None:
                         shot_obj.keyframe_path = kf_path
 
-                    transcript_snippet = (transcripts[idx] or "").strip()
+                    transcript_snippet = _clean_transcript_text(transcripts[idx] if idx < len(transcripts) else "")
+                    transcript_snippet = (transcript_snippet or "").strip()
                     if len(transcript_snippet) > 260:
                         transcript_snippet = transcript_snippet[:260] + "…"
 
@@ -750,6 +1166,20 @@ async def process_video_task(video_id: str, config: dict):
                     motion = await _motion_estimate(canonical_path, float(start_sec), float(end_sec), motion_tmp)
                     neighbors = all_neighbors[idx] if idx < len(all_neighbors) else []
 
+                    # Build user-facing heading/description from transcript+signals.
+                    signals_obj = {
+                        "motion": motion,
+                        "audio_rms": audio_rms,
+                        "scene_change": scene_change,
+                        "transcript_density": float(transcript_density),
+                        "duration_sec": float(duration),
+                    }
+                    heading, description = _evidence_heading_description(
+                        transcript_snippet=transcript_snippet,
+                        shot_index=int(idx),
+                        signals=signals_obj,
+                    )
+
                     evidence_items.append({
                         "index": j,
                         "shot_index": int(idx),
@@ -757,18 +1187,61 @@ async def process_video_task(video_id: str, config: dict):
                         "orig_start": float(start_sec),
                         "orig_end": float(end_sec),
                         "score": float(all_scores[idx]) if idx < len(all_scores) else None,
-                        "bullet": bullet_lines[j] if j < len(bullet_lines) else (transcript_snippet[:120] + ("…" if len(transcript_snippet) > 120 else "")),
+                        # Backward-compatible: keep `bullet` as the primary heading.
+                        "bullet": heading,
+                        "description": description,
                         "transcript_snippet": transcript_snippet,
                         "thumbnail_path": kf_path,
                         "signals": {
-                            "motion": motion,
-                            "audio_rms": audio_rms,
-                            "scene_change": scene_change,
-                            "transcript_density": float(transcript_density),
-                            "duration_sec": float(duration),
+                            **signals_obj,
                         },
                         "neighbors": neighbors,
                     })
+
+                # Add a compact justification string per evidence item (computed after we have the full set,
+                # so we can normalize signals within the evidence list).
+                try:
+                    keys = ["motion", "scene_change", "audio_rms", "transcript_density"]
+                    mins: dict[str, float] = {}
+                    maxs: dict[str, float] = {}
+                    for k in keys:
+                        vals: list[float] = []
+                        for it in evidence_items:
+                            v = (it.get("signals") or {}).get(k)
+                            if isinstance(v, (int, float)) and not math.isnan(float(v)):
+                                vals.append(float(v))
+                        if vals:
+                            mins[k] = min(vals)
+                            maxs[k] = max(vals)
+
+                    for it in evidence_items:
+                        sig = it.get("signals") or {}
+                        normalized: dict[str, float] = {}
+                        for k in keys:
+                            v = sig.get(k)
+                            if not isinstance(v, (int, float)) or math.isnan(float(v)):
+                                continue
+                            mn = mins.get(k)
+                            mx = maxs.get(k)
+                            if mn is None or mx is None:
+                                continue
+                            denom = (mx - mn) if (mx - mn) != 0 else 1.0
+                            normalized[k] = max(0.0, min(1.0, (float(v) - float(mn)) / float(denom)))
+                        it["justification"] = _evidence_justification(
+                            score=it.get("score"),
+                            signals=sig,
+                            neighbors=it.get("neighbors") or [],
+                            normalized_signals=normalized,
+                        )
+                except Exception:
+                    for it in evidence_items:
+                        if "justification" not in it:
+                            it["justification"] = _evidence_justification(
+                                score=it.get("score"),
+                                signals=it.get("signals") or {},
+                                neighbors=it.get("neighbors") or [],
+                                normalized_signals=None,
+                            )
 
                 await db.commit()
 
@@ -795,7 +1268,7 @@ async def process_video_task(video_id: str, config: dict):
 
                 chapters = _build_chapters_from_manifest(
                     merged_manifest=merged_manifest,
-                    transcriptions=transcripts,
+                    transcriptions=[_clean_transcript_text(t) for t in transcripts],
                     min_chapters=5,
                     max_chapters=12,
                 )
@@ -827,7 +1300,7 @@ async def process_video_task(video_id: str, config: dict):
                         "text_length": text_length,
                         "summary_type": summary_type,
                         "requested_format": summary_format,
-                        "generated_formats": ["bullet", "structured", "plain"],
+                        "generated_formats": list(all_formats.keys()) or [summary_format],
                         "merged_video_enabled": merged_video_path is not None,
                         "merged_manifest": merged_manifest,
                         "evidence": evidence_items,
@@ -847,6 +1320,18 @@ async def process_video_task(video_id: str, config: dict):
                     stage="completed",
                     progress=100,
                 )
+
+                # Cleanup even on the long-video early return path
+                try:
+                    uploaded_file_path = os.path.join(settings.UPLOAD_DIR, video.filename)
+                    _cleanup_video_artifacts(
+                        video_id=video_id,
+                        uploaded_file_path=uploaded_file_path,
+                        canonical_path=canonical_path,
+                        keep_outputs=True,
+                    )
+                except Exception as cleanup_error:
+                    logger.warning(f"Cleanup error for {video_id} (long video): {cleanup_error}")
                 return
             
             # 3. Shot Detection (use lower threshold 0.25 to detect more shots)
@@ -906,15 +1391,21 @@ async def process_video_task(video_id: str, config: dict):
             await db.commit()
             await _send_log(video_id, "Extracting frames and audio", stage="feature_extraction", progress=55)
             
-            # Extract keyframes
-            keyframe_paths = await sample_frames_for_shots(canonical_path, shots_times, video_id)
+            # Extract keyframes (multiple per shot) and track counts for aggregation
+            keyframe_paths, frames_per_shot = await sample_frames_for_shots(
+                canonical_path,
+                shots_times,
+                video_id,
+                frames_per_shot=3,
+            )
 
             # Persist keyframes so the frontend can display thumbnails even after cleanup
             keyframes_out_dir = os.path.join(settings.OUTPUT_DIR, "keyframes", video_id)
             os.makedirs(keyframes_out_dir, exist_ok=True)
             persisted_keyframes: list[str] = []
-            for i, keyframe_path in enumerate(keyframe_paths):
-                src = str(keyframe_path)
+            offset = 0
+            for i, count in enumerate(frames_per_shot):
+                src = keyframe_paths[offset] if offset < len(keyframe_paths) else ""
                 dst = os.path.join(keyframes_out_dir, f"shot_{i:04d}.jpg")
                 try:
                     if src and os.path.exists(src):
@@ -925,6 +1416,7 @@ async def process_video_task(video_id: str, config: dict):
                 except Exception as e:
                     logger.warning(f"Failed to persist keyframe {i}: {e}")
                     persisted_keyframes.append("")
+                offset += count
             
             # Extract audio for shots (optional, can be slow for many shots)
             # For prototype, let's extract full audio and process chunks in memory or 
@@ -936,48 +1428,33 @@ async def process_video_task(video_id: str, config: dict):
             
             # Extract audio segments from video
             for i, (start, end) in enumerate(shots_times):
-                path = os.path.join(audio_dir, f"shot_{i:04d}.mp3")
+                path = os.path.join(audio_dir, f"shot_{i:04d}.wav")
                 await extract_audio_segment(canonical_path, start, end, path)
                 audio_paths.append(path)
 
             # Encoders
             vis_encoder = VisualEncoder()
             aud_encoder = AudioEncoder()
-            
-            # Extract visual and audio features in batches to avoid CUDA OOM
-            logger.info(f"Extracting features for {len(keyframe_paths)} shots")
-            batch_size = 2  # Reduced from 4 - audio files need more memory on 8GB GPU
-            vis_feats_list = []
-            aud_feats_list = []
-            
-            for batch_idx in range(0, len(keyframe_paths), batch_size):
-                batch_end = min(batch_idx + batch_size, len(keyframe_paths))
-                batch_num = (batch_idx // batch_size) + 1
-                total_batches = (len(keyframe_paths) + batch_size - 1) // batch_size
-                
-                logger.info(f"Processing batch {batch_num}/{total_batches} ({batch_idx}-{batch_end}/{len(keyframe_paths)})")
-                
-                # Process visual features for this batch
-                vis_batch = vis_encoder.encode(keyframe_paths[batch_idx:batch_end])
-                vis_feats_list.append(vis_batch)
-                
-                # Process audio features for this batch
-                aud_batch = aud_encoder.encode(audio_paths[batch_idx:batch_end])
-                aud_feats_list.append(aud_batch)
-                
-                # Clear CUDA cache between batches more aggressively
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                    # Force garbage collection
-                    import gc
-                    gc.collect()
-            
-            # Concatenate all batches
-            vis_feats = torch.cat(vis_feats_list, dim=0) if vis_feats_list else torch.empty(0, 768)
-            aud_feats = torch.cat(aud_feats_list, dim=0) if aud_feats_list else torch.empty(0, 768)
-            
-            # Clear CUDA memory after concatenating features
+
+            # Visual: encode all frames then mean-pool per shot
+            frame_feats = vis_encoder.encode(keyframe_paths)
+            shot_embs = []
+            offset = 0
+            for n in frames_per_shot:
+                if n <= 0:
+                    shot_embs.append(torch.zeros(768))
+                    continue
+                slice_feats = frame_feats[offset : offset + n]
+                offset += n
+                if slice_feats.numel() == 0:
+                    shot_embs.append(torch.zeros(768))
+                else:
+                    shot_embs.append(slice_feats.mean(dim=0))
+            vis_feats = torch.stack(shot_embs) if shot_embs else torch.empty(0, 768)
+
+            # Audio remains one segment per shot
+            aud_feats = aud_encoder.encode(audio_paths)
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -1107,14 +1584,22 @@ async def process_video_task(video_id: str, config: dict):
             # 6. Text Summary Generation - MAIN FEATURE
             await _send_log(video_id, "Generating text summaries in multiple formats", stage="summarization", progress=85)
 
-            all_formats = {"bullet": "", "structured": "", "plain": ""}
+            all_formats: dict[str, str] = {}
             evidence_items: list[dict] = []
+            used_gemini_text = False
             if used_fallback:
                 # Gemini already produced a plain summary; format locally for the other views
                 summarizer = inference_service.manager.get_summarizer()
-                all_formats["plain"] = gemini_text
-                all_formats["bullet"] = summarizer.format_text(gemini_text, "bullet", summary_type=summary_type, text_length=text_length)
-                all_formats["structured"] = summarizer.format_text(gemini_text, "structured", summary_type=summary_type, text_length=text_length)
+                if summary_format == "plain":
+                    all_formats["plain"] = gemini_text
+                else:
+                    formatted = summarizer.format_text(
+                        gemini_text,
+                        summary_format,
+                        summary_type=summary_type,
+                        text_length=text_length,
+                    )
+                    all_formats[summary_format] = formatted
             else:
                 # Transcribe once so we can attach evidence snippets to bullets
                 transcriber = inference_service.manager.get_whisper()
@@ -1124,7 +1609,7 @@ async def process_video_task(video_id: str, config: dict):
                     try:
                         if audio_path_obj.exists():
                             t = transcriber.transcribe(audio_path_obj, cache_dir=None)
-                            transcripts.append((t or "").strip())
+                            transcripts.append(_clean_transcript_text((t or "").strip()))
                         else:
                             transcripts.append("")
                     except Exception as e:
@@ -1132,6 +1617,54 @@ async def process_video_task(video_id: str, config: dict):
                         transcripts.append("")
 
                 summarizer = inference_service.manager.get_summarizer()
+                try:
+                    nonempty = sum(1 for t in transcripts if t and t.strip())
+                    total_words = sum(_safe_word_count(t) for t in transcripts if t and t.strip())
+                    logger.info(f"Transcript stats: nonempty={nonempty}/{len(transcripts)}, total_words={total_words}")
+                    if total_words < 25:
+                        logger.warning(
+                            "Transcript signal is sparse/noisy; summary may be shorter or rely more on visual cues"
+                        )
+                except Exception:
+                    pass
+
+                # Optional Gemini override for text summary (does not affect GNN scoring / merged video)
+                try:
+                    gemini_enabled = bool(getattr(settings, "ENABLE_GEMINI_SUMMARIZER", False))
+                    gemini_force = bool(getattr(settings, "FORCE_GEMINI_SUMMARIZER", False))
+                except Exception:
+                    gemini_enabled = False
+                    gemini_force = False
+
+                if gemini_enabled and (gemini_force or ("total_words" in locals() and int(total_words) < 60)):
+                    gemini = get_gemini_summarizer()
+                    if gemini.is_available():
+                        await _send_log(video_id, "Using Gemini for text summary (override enabled)", level="WARNING", stage="summarization", progress=86)
+                        gem_text, gem_meta = gemini.summarize_video_from_path(
+                            video_path=canonical_path,
+                            summary_type=summary_type,
+                            text_length=text_length,
+                            summary_format="plain",
+                        )
+                        if gem_text:
+                            if summary_format == "plain":
+                                all_formats["plain"] = gem_text
+                            else:
+                                formatted = summarizer.format_text(
+                                    gem_text,
+                                    summary_format,
+                                    summary_type=summary_type,
+                                    text_length=text_length,
+                                )
+                                all_formats[summary_format] = formatted
+                            used_gemini_text = True
+                            await _send_log(video_id, "✓ Gemini text summary generated", level="WARNING", stage="summarization", progress=87)
+                        else:
+                            logger.warning(f"Gemini override enabled but failed: {gem_meta}")
+
+                if used_gemini_text:
+                    # Still build evidence items from transcripts + scores below.
+                    pass
                 k_ratio = max(0.0, min(1.0, float(getattr(settings, "TOPK_RATIO", 0.15))))
                 n = len(transcripts)
                 # Ensure we pick a reasonable minimum number of shots for short videos,
@@ -1145,28 +1678,35 @@ async def process_video_task(video_id: str, config: dict):
                 min_top_k = int(min(max(1, n), min_top_k))
                 top_k = max(min_top_k, int(__import__('numpy').ceil(k_ratio * n))) if n > 0 else 1
                 top_k = int(min(top_k, n)) if n > 0 else 1
-                all_formats = summarizer.summarize_all_formats(
-                    transcripts=transcripts,
-                    gnn_scores=gnn_scores.tolist() if hasattr(gnn_scores, 'tolist') else list(gnn_scores),
+
+                base_scores_list = gnn_scores.tolist() if hasattr(gnn_scores, 'tolist') else list(gnn_scores)
+                scores_for_summary = _adjust_scores_for_summary_type(
                     summary_type=summary_type,
-                    text_length=text_length,
-                    top_k=top_k
+                    base_scores=[float(s) for s in base_scores_list],
+                    transcripts=transcripts,
+                    shots_times=shots_times,
+                    audio_paths=[str(p) for p in audio_paths],
+                    keyframe_paths=[str(p) for p in persisted_keyframes],
                 )
+                if not used_gemini_text:
+                    all_formats = summarizer.summarize_all_formats(
+                        transcripts=transcripts,
+                        gnn_scores=scores_for_summary,
+                        summary_type=summary_type,
+                        text_length=text_length,
+                        top_k=top_k,
+                        video_path=canonical_path,
+                        formats=[summary_format],
+                    )
 
                 # Build evidence items by aligning bullet lines to top-K shot indices.
-                scores_list = gnn_scores.tolist() if hasattr(gnn_scores, 'tolist') else list(gnn_scores)
+                scores_list = scores_for_summary
                 scores_arr = __import__('numpy').array(scores_list, dtype=float)
                 if scores_arr.size > 0:
                     top_indices = scores_arr.argsort()[::-1][: min(top_k, scores_arr.size)]
                     top_indices_sorted = sorted([int(i) for i in top_indices])
                 else:
                     top_indices_sorted = []
-
-                bullet_lines = [
-                    line.strip().lstrip("•").strip()
-                    for line in (all_formats.get("bullet") or "").splitlines()
-                    if line.strip().startswith("•")
-                ]
 
                 for j, shot_idx in enumerate(top_indices_sorted):
                     start_sec, end_sec = shots_times[shot_idx] if shot_idx < len(shots_times) else (0.0, 0.0)
@@ -1178,7 +1718,7 @@ async def process_video_task(video_id: str, config: dict):
 
                     # Explainability signals (cheap but informative)
                     duration = float(end_sec - start_sec) if end_sec and start_sec else 0.0
-                    wc = _safe_word_count(transcriptions[shot_idx] if shot_idx < len(transcriptions) else "")
+                    wc = _safe_word_count(transcripts[shot_idx] if shot_idx < len(transcripts) else "")
                     transcript_density = (wc / max(0.25, duration)) if duration > 0 else float(wc)
                     audio_rms = _audio_rms_energy(audio_paths[shot_idx] if shot_idx < len(audio_paths) else None)
                     prev_kf = persisted_keyframes[shot_idx - 1] if shot_idx - 1 >= 0 and shot_idx - 1 < len(persisted_keyframes) else None
@@ -1190,6 +1730,27 @@ async def process_video_task(video_id: str, config: dict):
                     motion = await _motion_estimate(canonical_path, float(start_sec), float(end_sec), motion_tmp)
 
                     neighbors = _graph_neighbors(graph_data, int(shot_idx), max_neighbors=8)
+
+                    signals = {
+                        "motion": motion,
+                        "audio_rms": audio_rms,
+                        "scene_change": scene_change,
+                        "transcript_density": float(transcript_density),
+                        "duration_sec": float(duration),
+                    }
+
+                    heading, description = _evidence_heading_description(
+                        transcript_snippet=transcript_snippet,
+                        shot_index=int(shot_idx),
+                        signals=signals,
+                    )
+                    justification = _evidence_justification(
+                        score=float(scores_list[shot_idx]) if shot_idx < len(scores_list) and scores_list[shot_idx] is not None else None,
+                        signals=signals,
+                        neighbors=neighbors,
+                        normalized_signals=None,
+                    )
+
                     evidence_items.append({
                         "index": j,
                         "shot_index": int(shot_idx),
@@ -1197,16 +1758,12 @@ async def process_video_task(video_id: str, config: dict):
                         "orig_start": float(start_sec),
                         "orig_end": float(end_sec),
                         "score": float(scores_list[shot_idx]) if shot_idx < len(scores_list) else None,
-                        "bullet": bullet_lines[j] if j < len(bullet_lines) else (transcript_snippet[:120] + ("…" if len(transcript_snippet) > 120 else "")),
+                        "bullet": heading,
+                        "description": description,
+                        "justification": justification,
                         "transcript_snippet": transcript_snippet,
                         "thumbnail_path": thumb_path,
-                        "signals": {
-                            "motion": motion,
-                            "audio_rms": audio_rms,
-                            "scene_change": scene_change,
-                            "transcript_density": float(transcript_density),
-                            "duration_sec": float(duration),
-                        },
+                        "signals": signals,
                         "neighbors": neighbors,
                     })
 
@@ -1251,9 +1808,25 @@ async def process_video_task(video_id: str, config: dict):
                 else:
                     merged_video_path, merged_manifest = merge_result, []
 
+                # Persist merged video into outputs so we can safely clear temp without breaking downloads/history
+                if merged_video_path and os.path.exists(merged_video_path):
+                    merged_out_dir = os.path.join(settings.OUTPUT_DIR, "merged")
+                    os.makedirs(merged_out_dir, exist_ok=True)
+                    merged_out_path = os.path.join(merged_out_dir, f"{video_id}.mp4")
+                    try:
+                        try:
+                            shutil.move(merged_video_path, merged_out_path)
+                        except Exception:
+                            # Cross-device move fallback
+                            shutil.copyfile(merged_video_path, merged_out_path)
+                            _safe_remove_path(merged_video_path)
+                        merged_video_path = merged_out_path
+                    except Exception as persist_err:
+                        logger.warning(f"Failed to persist merged video to outputs: {persist_err}")
+
                 chapters = _build_chapters_from_manifest(
                     merged_manifest=merged_manifest,
-                    transcriptions=transcriptions,
+                    transcriptions=[_clean_transcript_text(t) for t in transcriptions],
                     min_chapters=5,
                     max_chapters=12,
                 )
@@ -1306,7 +1879,7 @@ async def process_video_task(video_id: str, config: dict):
                     "text_length": text_length,
                     "summary_type": summary_type,
                     "requested_format": summary_format,
-                    "generated_formats": ["bullet", "structured", "plain"],
+                        "generated_formats": list(all_formats.keys()) or [summary_format],
                     "merged_video_enabled": merged_video_path is not None,
                     "merged_manifest": merged_manifest,
                     "evidence": evidence_items,
@@ -1329,22 +1902,13 @@ async def process_video_task(video_id: str, config: dict):
             # 9. Cleanup temporary files
             await _send_log(video_id, "Cleaning up temporary files...", stage="cleanup", progress=99)
             try:
-                # Clean upload directory for this video
                 uploaded_file_path = os.path.join(settings.UPLOAD_DIR, video.filename)
-                if os.path.exists(uploaded_file_path):
-                    os.remove(uploaded_file_path)
-                    logger.info(f"Cleaned up uploaded file: {uploaded_file_path}")
-                
-                # Clean processed directory for this video (frames, audio segments, etc.)
-                video_processed_dir = os.path.join(settings.PROCESSED_DIR, video_id)
-                if os.path.exists(video_processed_dir):
-                    shutil.rmtree(video_processed_dir)
-                    logger.info(f"Cleaned up processed directory: {video_processed_dir}")
-                
-                # Clean canonical video if it's different from source
-                if canonical_path != uploaded_file_path and os.path.exists(canonical_path):
-                    os.remove(canonical_path)
-                    logger.info(f"Cleaned up canonical video: {canonical_path}")
+                _cleanup_video_artifacts(
+                    video_id=video_id,
+                    uploaded_file_path=uploaded_file_path,
+                    canonical_path=canonical_path,
+                    keep_outputs=True,
+                )
                 
                 await _send_log(video_id, "✓ Temporary files cleaned up", stage="cleanup", progress=100)
             except Exception as cleanup_error:

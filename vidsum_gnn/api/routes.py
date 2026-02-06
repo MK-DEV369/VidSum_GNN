@@ -241,7 +241,7 @@ async def upload_video(
     await broadcast_log(request, video_id, {
         "timestamp": datetime.now().isoformat(),
         "level": "INFO",
-        "message": f"Starting upload: {file.filename} ({file.size or 0} bytes)",
+        "message": f"Starting upload: {file.filename}",
         "stage": "UPLOAD",
         "progress": 5
     })
@@ -488,6 +488,8 @@ async def get_summary_evidence(
         items.append({
             "index": ev.get("index"),
             "bullet": ev.get("bullet"),
+            "description": ev.get("description"),
+            "justification": ev.get("justification"),
             "shot_index": shot_index,
             "shot_id": ev.get("shot_id"),
             "orig_start": ev.get("orig_start"),

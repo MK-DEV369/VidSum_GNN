@@ -6,6 +6,7 @@ import torch
 import librosa
 import json
 import time
+import re
 from pathlib import Path
 from typing import Optional
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
@@ -16,6 +17,29 @@ from vidsum_gnn.utils.logging import get_logger
 from vidsum_gnn.core.config import settings
 
 logger = get_logger(__name__)
+
+
+def _looks_like_repetition_hallucination(text: str) -> bool:
+    """Detect low-signal Whisper hallucinations like repeated single words.
+    We keep this conservative to avoid dropping real speech.
+    """
+    import re
+
+    t = (text or "").strip()
+    if len(t) < 8:
+        return False
+    words = [w.lower() for w in re.findall(r"[a-zA-Z]{2,}", t)]
+    if len(words) < 12:
+        return False
+    uniq = len(set(words))
+    if uniq > 2:
+        return False
+    # Frequency of most common word
+    counts = {}
+    for w in words:
+        counts[w] = counts.get(w, 0) + 1
+    top = max(counts.values()) if counts else 0
+    return (top / max(1, len(words))) >= 0.75
 
 
 def retry_with_backoff(func, max_retries=3, initial_delay=2):
@@ -132,11 +156,28 @@ class WhisperTranscriber:
                 logger.warning(f"Audio loaded but empty: {audio_path}")
                 return ""
             
-            # Skip very short audio (< 0.5 seconds) - usually UI noise
+            # Skip very short audio (usually UI noise)
             duration = len(audio) / 16000
-            if duration < 0.5:
-                logger.debug(f"Skipping very short audio ({duration:.2f}s): {audio_path}")
+            min_dur = float(getattr(settings, "WHISPER_MIN_DURATION_SEC", 0.5) or 0.5)
+            if duration < min_dur:
+                logger.debug(f"Skipping very short audio ({duration:.2f}s < {min_dur:.2f}s): {audio_path}")
                 return ""
+
+            # Skip near-silent segments. This prevents Whisper from hallucinating a repeated token
+            # (we've observed 'Commission ...' style outputs) on low-energy audio.
+            try:
+                import numpy as _np
+
+                rms = float(_np.sqrt(_np.mean(_np.square(audio)))) if len(audio) else 0.0
+                thr = float(getattr(settings, "WHISPER_SILENCE_RMS_THRESHOLD", 0.0015) or 0.0015)
+                if rms < thr:
+                    logger.debug(
+                        f"Skipping near-silent audio (rms={rms:.4f} < {thr:.4f}, {duration:.2f}s): {audio_path}"
+                    )
+                    return ""
+            except Exception:
+                # Never fail transcription due to RMS computation.
+                pass
             
             # Process through Whisper
             inputs = self.processor(audio, sampling_rate=16000, return_tensors="pt")
@@ -160,10 +201,6 @@ class WhisperTranscriber:
                 generated_ids = self.model.generate(
                     inputs["input_features"],
                     max_new_tokens=128,
-                    # IMPORTANT:
-                    # Whisper models often ship with default forced_decoder_ids that can
-                    # effectively force English. Passing forced_decoder_ids=None clears that
-                    # and enables auto language detection.
                     forced_decoder_ids=forced_decoder_ids,
                 )
             
@@ -171,6 +208,25 @@ class WhisperTranscriber:
                 generated_ids,
                 skip_special_tokens=True
             )[0].strip()
+
+            if _looks_like_repetition_hallucination(transcription):
+                # Instead of fully discarding (which forces visual-only fallback),
+                # keep a short deduped fragment so downstream summarization has some signal.
+                tokens = transcription.split()
+                dedup = []
+                for t in tokens:
+                    if not dedup or dedup[-1].lower() != t.lower():
+                        dedup.append(t)
+                fragment = " ".join(dedup[:12]).strip()
+                if len(fragment.split()) < 3:
+                    logger.warning(
+                        f"Transcription looks like repetition hallucination; dropping: {transcription[:60]}"
+                    )
+                    return ""
+                logger.warning(
+                    f"Transcription looks like repetition hallucination; using deduped fragment: {fragment[:60]}"
+                )
+                transcription = fragment
             
             # Filter garbage transcriptions (all special chars, very short, etc.)
             if len(transcription) < 3:

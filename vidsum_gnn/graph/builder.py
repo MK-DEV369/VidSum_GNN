@@ -1,8 +1,6 @@
 import torch
-import numpy as np
 from torch_geometric.data import Data
-from sklearn.metrics.pairwise import cosine_similarity
-from typing import List, Dict, Any
+from typing import List, Dict
 
 class GraphBuilder:
     def __init__(self, k_sim: int = 5, sim_threshold: float = 0.65, max_edges: int = 20):
@@ -17,6 +15,16 @@ class GraphBuilder:
         features: Tensor of shape (num_shots, feature_dim)
         """
         num_nodes = len(shots)
+        if num_nodes <= 0:
+            return Data(
+                x=features,
+                edge_index=torch.empty((2, 0), dtype=torch.long),
+                edge_attr=torch.empty((0, 4), dtype=torch.float),
+            )
+        if num_nodes == 1:
+            edge_index_tensor = torch.tensor([[0], [0]], dtype=torch.long)
+            edge_attr_tensor = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float)
+            return Data(x=features, edge_index=edge_index_tensor, edge_attr=edge_attr_tensor)
         edge_index = []
         edge_attr = []
 
@@ -46,18 +54,26 @@ class GraphBuilder:
         # Remove self-loops for top-k
         sim_matrix.fill_diagonal_(-1.0)
         
-        values, indices = torch.topk(sim_matrix, k=min(self.k_sim, num_nodes-1), dim=1)
+        k = min(self.k_sim, num_nodes - 1)
+        if k > 0:
+            values, indices = torch.topk(sim_matrix, k=k, dim=1)
+        else:
+            values, indices = None, None
         
-        for i in range(num_nodes):
-            for k in range(indices.shape[1]):
-                j = indices[i, k].item()
-                sim = values[i, k].item()
-                
-                if sim > self.sim_threshold:
-                    edge_index.append([i, j])
-                    # Attr: [is_temporal, distance, sim, audio_corr]
-                    attr = [0.0, 0.0, sim, 0.0]
-                    edge_attr.append(attr)
+        if indices is not None and values is not None:
+            for i in range(num_nodes):
+                for kk in range(indices.shape[1]):
+                    j = indices[i, kk].item()
+                    sim = values[i, kk].item()
+                    
+                    if sim > self.sim_threshold:
+                        # Bidirectional semantic edge
+                        edge_index.append([i, j])
+                        edge_index.append([j, i])
+                        # Attr: [is_temporal, distance, sim, audio_corr]
+                        attr = [0.0, 0.0, sim, 0.0]
+                        edge_attr.append(attr)
+                        edge_attr.append(attr)
 
         # 3. Audio Edges (Placeholder logic)
         # If we had audio features separate, we'd do similar correlation check.
@@ -67,6 +83,11 @@ class GraphBuilder:
             # Fallback: just temporal
             edge_index = [[0, 0]]  # Self loop to avoid crash if single node
             edge_attr = [[1.0, 0.0, 0.0, 0.0]]
+
+        # Simple safety cap on total directed edges.
+        if isinstance(self.max_edges, int) and self.max_edges > 0 and len(edge_index) > self.max_edges:
+            edge_index = edge_index[: self.max_edges]
+            edge_attr = edge_attr[: self.max_edges]
         
         edge_index_tensor = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
         edge_attr_tensor = torch.tensor(edge_attr, dtype=torch.float)

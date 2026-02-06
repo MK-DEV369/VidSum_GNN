@@ -11,10 +11,12 @@ import torch
 import numpy as np
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
+import time
 
 from vidsum_gnn.inference.model_manager import ModelManager
 from vidsum_gnn.utils.logging import get_logger
 from vidsum_gnn.core.config import settings
+from vidsum_gnn.inference.summarization import _clean_transcript_text
 
 logger = get_logger(__name__)
 
@@ -52,6 +54,7 @@ class InferenceService:
             importance_scores: (N,) numpy array
         """
         device = self.manager.get_device()
+        t0 = time.perf_counter()
         # Ensure model matches feature dimension and load configured checkpoint
         model = self.manager.get_gnn_model(
             checkpoint_path=Path(settings.GNN_CHECKPOINT) if settings.GNN_CHECKPOINT else None,
@@ -71,6 +74,10 @@ class InferenceService:
             self._last_hidden = None
         # Convert logits to probabilities for binary classification
         probs = torch.sigmoid(scores)
+
+        logger.debug(
+            f"GNN inference: n={probs.numel()} device={device} elapsed={time.perf_counter() - t0:.3f}s"
+        )
         
         # Return as numpy array
         return probs.cpu().numpy().reshape(-1)
@@ -143,13 +150,16 @@ class InferenceService:
         transcriber = self.manager.get_whisper()
         transcripts: List[str] = []
 
+        t0 = time.perf_counter()
+
         for audio_path in audio_paths:
             audio_path_obj = Path(audio_path) if isinstance(audio_path, str) else audio_path
             if audio_path_obj.exists():
                 try:
                     transcript = transcriber.transcribe(audio_path_obj, cache_dir)
-                    if transcript and len(transcript.strip()) > 3:
-                        transcripts.append(transcript.strip())
+                    cleaned = _clean_transcript_text(transcript or "")
+                    if cleaned and len(cleaned.strip()) > 3:
+                        transcripts.append(cleaned.strip())
                     else:
                         transcripts.append("")
                 except Exception as e:
@@ -159,7 +169,10 @@ class InferenceService:
                 transcripts.append("")
 
         valid_transcripts = sum(1 for t in transcripts if t)
-        logger.info(f"Transcription complete ({valid_transcripts}/{len(transcripts)} valid)")
+        total_words = sum(len(t.split()) for t in transcripts if t)
+        logger.info(
+            f"Transcription complete ({valid_transcripts}/{len(transcripts)} valid, {total_words} words, {time.perf_counter() - t0:.1f}s)"
+        )
         if valid_transcripts == 0:
             logger.warning("No valid transcriptions found - video may contain only music/noise")
             fallback = "⚠️ No speech detected in video - unable to generate summary"
@@ -171,6 +184,10 @@ class InferenceService:
         n = len(gnn_scores)
         k_ratio = max(0.0, min(1.0, float(getattr(settings, "TOPK_RATIO", 0.15))))
         top_k = max(1, int(np.ceil(k_ratio * n))) if n > 0 else 1
+
+        logger.debug(
+            f"Summarization params: type={summary_type} length={text_length} top_k={top_k} (ratio={k_ratio:.2f}, n={n})"
+        )
 
         logger.info(f"Generating {text_length} summaries in all formats")
         summaries = summarizer.summarize_all_formats(

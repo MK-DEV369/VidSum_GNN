@@ -4,7 +4,8 @@ FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    TOKENIZERS_PARALLELISM=false
 
 # Remove conda ffmpeg (missing libx264) and install system ffmpeg with x264 support
 RUN conda uninstall -y ffmpeg || true

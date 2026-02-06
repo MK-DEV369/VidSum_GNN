@@ -1,8 +1,9 @@
-"""
-Structured logging utilities for VidSum GNN pipeline.
+"""Structured logging utilities for VidSum GNN pipeline.
+
 Provides progress tracking, batch-level logging, and real-time updates.
 """
 import logging
+import os
 import sys
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -36,6 +37,13 @@ class StructuredLogger:
         self.name = name
         self.video_id = video_id
         self.logger = logging.getLogger(name)
+
+        # Respect global logging config when set, otherwise fall back to env.
+        env_level = (os.getenv("LOG_LEVEL") or "").strip().upper()
+        if env_level:
+            desired_level = getattr(logging, env_level, logging.INFO)
+        else:
+            desired_level = logging.getLogger().getEffectiveLevel()
         
         if not self.logger.handlers:
             handler = logging.StreamHandler(sys.stdout)
@@ -45,7 +53,11 @@ class StructuredLogger:
             )
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
+
+        # Set level after handlers are configured.
+        self.logger.setLevel(desired_level)
+        # Avoid duplicate logs via root logger handlers.
+        self.logger.propagate = False
     
     def log(
         self,

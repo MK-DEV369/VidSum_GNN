@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Optional
 from sentence_transformers import SentenceTransformer
+import torch
 from requests.exceptions import ConnectionError, ChunkedEncodingError
 from urllib3.exceptions import IncompleteRead
 
@@ -61,7 +62,10 @@ class TextEmbedder:
             model_name: HuggingFace model identifier
             device: Target device (cuda/cpu), auto-detected if None
         """
-        self.device = device or "cuda"  # SentenceTransformer handles fallback
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
         self.model_name = model_name
         
         logger.info(f"Loading text embedder: {model_name}")
@@ -84,6 +88,12 @@ class TextEmbedder:
         Returns:
             Embedding vector as numpy array
         """
+        t = (text or "").strip()
+        if cache_path:
+            cache_path = Path(cache_path)
+            if cache_path.suffix.lower() != ".npy":
+                cache_path = cache_path.with_suffix(".npy")
+
         # Check cache
         if cache_path and cache_path.exists():
             try:
@@ -92,7 +102,7 @@ class TextEmbedder:
                 logger.warning(f"Failed to load cached embedding: {e}")
         
         # Generate embedding
-        embedding = self.model.encode(text, convert_to_numpy=True)
+        embedding = self.model.encode(t, convert_to_numpy=True)
         
         # Save cache
         if cache_path:
